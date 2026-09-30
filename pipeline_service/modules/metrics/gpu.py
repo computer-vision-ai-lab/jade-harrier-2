@@ -279,6 +279,11 @@ def _benchmark_single_gpu(
     max_idle = float(os.environ.get("BENCHMARK_MAX_IDLE_TEMP_C", "60"))
     if temp_idle is not None and max_idle > 0 and temp_idle > max_idle:
         reasons.append(f"idle temperature {temp_idle} C > {max_idle:.0f}")
+    # A failing cooler heats well past its neighbours during the short bench before the slowdown flag trips; healthy H100/H200
+    # SXM units read 42-57 C here.
+    max_load = float(os.environ.get("BENCHMARK_MAX_LOAD_TEMP_C", "75" if ("H200" in gpu_name.upper() or "H100" in gpu_name.upper()) else "0"))
+    if temp_load is not None and max_load > 0 and temp_load > max_load:
+        reasons.append(f"temperature under load {temp_load} C > {max_load:.0f}")
 
     del Ws, a, b
     torch.cuda.empty_cache()

@@ -43,11 +43,13 @@ _PREFLIGHT_ENV = {
     "min_stream48_gbps": "BENCHMARK_MIN_STREAM48_GBPS",
     "min_power_limit_w": "BENCHMARK_MIN_POWER_LIMIT_W",
     "min_download_mbps": "BENCHMARK_MIN_DOWNLOAD_MBPS",
-    # thermal / outlier gates (gpu.py + check_gpu); defaults: 1000 MHz, 60 C, 0.85, 25 C
+    # thermal / outlier gates (gpu.py + check_gpu); defaults: 1000 MHz, 60 C, 0.85, 25 C, 75 C, 20 C
     "min_sm_clock_mhz": "BENCHMARK_MIN_SM_CLOCK_MHZ",
     "max_idle_temp_c": "BENCHMARK_MAX_IDLE_TEMP_C",
     "outlier_ratio": "BENCHMARK_OUTLIER_RATIO",
     "max_idle_temp_spread_c": "BENCHMARK_MAX_IDLE_TEMP_SPREAD_C",
+    "max_load_temp_c": "BENCHMARK_MAX_LOAD_TEMP_C",
+    "max_load_temp_spread_c": "BENCHMARK_MAX_LOAD_TEMP_SPREAD_C",
 }
 
 
@@ -190,17 +192,24 @@ def _cross_gpu_checks(results) -> None:
         return
     ratio = float(os.environ.get("BENCHMARK_OUTLIER_RATIO", "0.85"))
     spread = float(os.environ.get("BENCHMARK_MAX_IDLE_TEMP_SPREAD_C", "25"))
+    load_spread = float(os.environ.get("BENCHMARK_MAX_LOAD_TEMP_SPREAD_C", "20"))
     for r in results:
         others = [o for o in results if o.gpu_id != r.gpu_id]
         med_t = _median([o.tflops_bf16 for o in others])
         med_s = _median([o.stream48_gbps for o in others])
+        med_s144 = _median([o.stream144_gbps for o in others])
         if ratio > 0 and med_t > 0 and r.tflops_bf16 < ratio * med_t:
             r.reasons.append(f"bf16 {r.tflops_bf16} TFLOPS < {ratio:.2f} x median of the other GPUs ({med_t:.0f})")
         if ratio > 0 and med_s > 0 and r.stream48_gbps < ratio * med_s:
             r.reasons.append(f"weight-stream M=48 {r.stream48_gbps:.0f} GB/s < {ratio:.2f} x median of the other GPUs ({med_s:.0f})")
+        if ratio > 0 and med_s144 > 0 and r.stream144_gbps < ratio * med_s144:
+            r.reasons.append(f"weight-stream M=144 {r.stream144_gbps:.0f} GB/s < {ratio:.2f} x median of the other GPUs ({med_s144:.0f})")
         idles = [o.temp_idle_c for o in others if o.temp_idle_c is not None]
         if spread > 0 and r.temp_idle_c is not None and idles and r.temp_idle_c > _median(idles) + spread:
             r.reasons.append(f"idle temperature {r.temp_idle_c} C > median of the other GPUs ({_median(idles):.0f}) + {spread:.0f}")
+        loads = [o.temp_load_c for o in others if o.temp_load_c is not None]
+        if load_spread > 0 and r.temp_load_c is not None and loads and r.temp_load_c > _median(loads) + load_spread:
+            r.reasons.append(f"temperature under load {r.temp_load_c} C > median of the other GPUs ({_median(loads):.0f}) + {load_spread:.0f}")
         if r.reasons:
             r.passed = False
 
