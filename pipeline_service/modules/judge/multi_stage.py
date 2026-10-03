@@ -609,6 +609,18 @@ def _s1_messages(prompt_url: str, left_url: str, right_url: str, angle_desc: str
     ]
 
 
+def _s1_early_gate(angles: list[dict], cfg: Any) -> bool:
+    """True when the angles judged so far are consistent, on the same side and wide enough to settle the duel."""
+    if not angles or any(a["contradictory"] for a in angles):
+        return False
+    diffs = [a["pen_a"] - a["pen_b"] for a in angles]
+    if any(d == 0 for d in diffs) or not (all(d > 0 for d in diffs) or all(d < 0 for d in diffs)):
+        return False
+    if len(angles) == 1 and cfg.single_angle_min_gap > 0 and abs(diffs[0]) >= cfg.single_angle_min_gap:
+        return True
+    return len(angles) >= cfg.angles and all(abs(d) >= cfg.min_gap for d in diffs)
+
+
 async def _s1_run(
     vlm: AsyncOpenAI,
     model: str,
@@ -617,6 +629,7 @@ async def _s1_run(
     left_views: ViewsAdapter,
     right_views: ViewsAdapter,
     seed: int,
+    early_stop: Any = None,
 ) -> dict:
     async def _ask(left_url: str, right_url: str, angle_desc: str) -> PenaltyResponse:
         async with sem:
@@ -634,61 +647,62 @@ async def _s1_run(
             )
             return cast(PenaltyResponse, r)
 
-    tasks: list[asyncio.Task] = []
-    for _theta, _phi, _weight, label in S1_ANGLES:
-        if not left_views.has_white(label) or not right_views.has_white(label):
-            logger.warning(f"S1: missing white view {label!r}, skipping angle")
-            continue
+    async def _angle(_theta: int, _phi: int, weight: float, label: str) -> dict:
         a_url = left_views.white_url(label)
         b_url = right_views.white_url(label)
         desc = S1_ANGLE_DESC[label]
-        tasks.append(asyncio.create_task(_ask(a_url, b_url, desc)))
-        tasks.append(asyncio.create_task(_ask(b_url, a_url, desc)))
-
-    if not tasks:
-        return {"angles": [], "n_total": 0, "n_contradictory": 0, "n_consistent": 0, "n_json_failed": 0}
-
-    raw = await asyncio.gather(*tasks)
-
-    angles: list[dict] = []
-    n_json_failed = 0
-    pair_idx = 0
-    for _theta, _phi, weight, label in S1_ANGLES:
-        if not left_views.has_white(label) or not right_views.has_white(label):
-            continue
-        ab = raw[pair_idx]
-        ba = raw[pair_idx + 1]
-        pair_idx += 2
+        ab, ba = await asyncio.gather(_ask(a_url, b_url, desc), _ask(b_url, a_url, desc))
         pen_a_ab, pen_b_ab = ab.penalty_1, ab.penalty_2
         pen_a_ba, pen_b_ba = ba.penalty_2, ba.penalty_1
         diff_ab = pen_a_ab - pen_b_ab
         diff_ba = pen_a_ba - pen_b_ba
         json_failed = ab.issues == JSON_FAILED_MARKER or ba.issues == JSON_FAILED_MARKER
-        if json_failed:
-            n_json_failed += 1
         contradictory = json_failed or ((diff_ab > 0 and diff_ba < 0) or (diff_ab < 0 and diff_ba > 0))
-        angles.append(
-            {
-                "theta": _theta,
-                "phi": _phi,
-                "weight": weight,
-                "label": label,
-                "ab": _strip_issues(ab),
-                "ba": _strip_issues(ba),
-                "pen_a": (pen_a_ab + pen_a_ba) / 2,
-                "pen_b": (pen_b_ab + pen_b_ba) / 2,
-                "diff_ab": diff_ab,
-                "diff_ba": diff_ba,
-                "contradictory": contradictory,
-                "json_failed": json_failed,
-            }
-        )
+        return {
+            "theta": _theta,
+            "phi": _phi,
+            "weight": weight,
+            "label": label,
+            "ab": _strip_issues(ab),
+            "ba": _strip_issues(ba),
+            "pen_a": (pen_a_ab + pen_a_ba) / 2,
+            "pen_b": (pen_b_ab + pen_b_ba) / 2,
+            "diff_ab": diff_ab,
+            "diff_ba": diff_ba,
+            "contradictory": contradictory,
+            "json_failed": json_failed,
+        }
+
+    order: list[tuple[int, int, float, str]] = []
+    for angle in S1_ANGLES:
+        if not left_views.has_white(angle[3]) or not right_views.has_white(angle[3]):
+            logger.warning(f"S1: missing white view {angle[3]!r}, skipping angle")
+            continue
+        order.append(angle)
+
+    if not order:
+        return {"angles": [], "n_total": 0, "n_contradictory": 0, "n_consistent": 0, "n_json_failed": 0, "early_stopped": 0}
+
+    angles: list[dict] = []
+    early_stopped = 0
+    if early_stop is not None and early_stop.enabled:
+        for angle in order[: early_stop.angles]:
+            angles.append(await _angle(*angle))
+            if _s1_early_gate(angles, early_stop):
+                early_stopped = len(angles)
+                break
+        if not early_stopped and len(angles) < len(order):
+            angles.extend(await asyncio.gather(*(_angle(*angle) for angle in order[len(angles):])))
+    else:
+        angles = list(await asyncio.gather(*(_angle(*angle) for angle in order)))
+
     return {
         "angles": angles,
         "n_total": len(angles),
         "n_contradictory": sum(1 for a in angles if a["contradictory"]),
         "n_consistent": sum(1 for a in angles if not a["contradictory"]),
-        "n_json_failed": n_json_failed,
+        "n_json_failed": sum(1 for a in angles if a["json_failed"]),
+        "early_stopped": early_stopped,
     }
 
 
@@ -1421,6 +1435,7 @@ async def evaluate_duel(
     model: str = MODEL,
     log_id: str = "",
     max_stage: int = 4,
+    early_stop: Any = None,
 ) -> tuple[str, dict]:
     """Run the multi-stage pipeline up to `max_stage`. Returns (winner, detail).
 
@@ -1446,7 +1461,9 @@ async def evaluate_duel(
 
     # Stage 1
     t = asyncio.get_running_loop().time()
-    s1 = await _s1_run(vlm, model, sem, prompt_data_url, left_views, right_views, seed)
+    s1 = await _s1_run(vlm, model, sem, prompt_data_url, left_views, right_views, seed, early_stop=early_stop)
+    if s1.get("early_stopped"):
+        logger.info(f"{log_id}: S1 early stop after {s1['early_stopped']} angle(s)")
     s1_choice, s1_reason = _s1_aggregate(s1)
     detail["s1"] = {**s1, "choice": s1_choice, "reason": s1_reason}
     detail["s1_slim"] = _slim_s1(s1, s1_choice)

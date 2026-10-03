@@ -4,7 +4,8 @@ api:
   debug: true
 
 pipeline:
-  batch_time_budget: 14400
+  batch_time_budget: 3000
+  candidate_deadline_s: 2100
   prompt_timeout: 600.0
   use_planner: false
   render_from_object: true
@@ -39,9 +40,10 @@ llm_clients:
     enabled: true
     base_url: "http://localhost:8001/v1"
     api_key: "local"
+    request_timeout_s: 900
     vllm:
-      model: "computer-vision-ai-lab/Qwen-3.6-27B-UmberShrike"
-      revision: "163c2f4168cfc86b047ea8226e0d06214005e123"
+      model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
+      revision: "14adb741b473bbd7bc0d02cacb27247d2cb707f6"
       gpu_ids: "0,1"
       tensor_parallel_size: 1
       data_parallel_size: 2
@@ -54,12 +56,31 @@ llm_clients:
     enabled: true
     base_url: "http://localhost:8002/v1"
     api_key: "local"
+    request_timeout_s: 300
     vllm:
       model: "zai-org/GLM-4.6V-Flash"
       revision: "411bb4d77144a3f03accbf4b780f5acb8b7cde4e" 
-      gpu_ids: "2,3"
+      gpu_ids: "2"
       tensor_parallel_size: 1
-      data_parallel_size: 2
+      data_parallel_size: 1
+      gpu_memory_utilization: 0.9
+      max_model_len: 81920
+      max_num_seqs: 64
+      extra_args: ["--max-num-batched-tokens", "16384"]
+      vllm_bin: "/opt/vllm-glm-env/bin/vllm"
+      trust_remote_code: true
+      reasoning_parser: null
+  judge-critic-instance-b:
+    enabled: true
+    base_url: "http://localhost:8020/v1"
+    api_key: "local"
+    request_timeout_s: 300
+    vllm:
+      model: "zai-org/GLM-4.6V-Flash"
+      revision: "411bb4d77144a3f03accbf4b780f5acb8b7cde4e" 
+      gpu_ids: "3"
+      tensor_parallel_size: 1
+      data_parallel_size: 1
       gpu_memory_utilization: 0.9
       max_model_len: 81920
       max_num_seqs: 64
@@ -75,7 +96,7 @@ embedder:
 actors:
   planner:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-UmberShrike"
+    model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
     workers: 256
     queue_size: 128
     max_tokens: 32768
@@ -93,7 +114,7 @@ actors:
       allow_fallbacks: true
   coder:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-UmberShrike"
+    model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
     workers: 96
     queue_size: 64
     max_tokens: 24576
@@ -106,7 +127,7 @@ actors:
     seed: 42
     enable_thinking: false
     multimodal: true
-    ensemble_size: 38
+    ensemble_size: 46
     ensemble_temperature: 0.7
     providers:
       order: []
@@ -135,6 +156,13 @@ actors:
       allow_fallbacks: true
   judge:
     client: "judge-critic-instance"
+    extra_clients: ["judge-critic-instance-b"]
+    s1_early_stop:
+      enabled: true
+      angles: 2
+      min_gap: 2.0
+      single_angle_min_gap: 2.5
+      max_round: 4
     model: "zai-org/GLM-4.6V-Flash"
     workers: 48
     queue_size: 48
@@ -154,7 +182,7 @@ actors:
 
 event_bus:
   max_iter: 2
-  task_deadline_s: 3600
+  task_deadline_s: 2700
   score_threshold: 0.55
 
 js_checker:

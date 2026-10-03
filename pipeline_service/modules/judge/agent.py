@@ -12,6 +12,7 @@ from modules.base_agent import BaseAgent
 from modules.judge import multi_stage as _ms
 from modules.judge.multi_stage import ViewsAdapter, best_view_similarity, evaluate_duel
 from modules.judge.schema import JudgeVerdict
+from llm.balancer import affinity_key as _affinity_key
 
 
 def _b64(image_bytes: bytes) -> str:
@@ -65,6 +66,7 @@ class JudgeAgent(BaseAgent):
         super().__init__(client, settings)
         self.max_stage = max_stage
         self.s1_concurrency = s1_concurrency
+        self.s1_early_stop = settings.s1_early_stop
         self.reasoning_effort = settings.reasoning_effort
         if not getattr(settings, "explain", False):
             # The explain call is opponent-independent and only fills detail["issues"]; skipping it saves the heaviest
@@ -93,6 +95,9 @@ class JudgeAgent(BaseAgent):
             return side, f"DINO tie-break (simA={sim_a:.3f} simB={sim_b:.3f} -> {side})", True
         return "A", "draw -> A (no DINO signal)", False
 
+    def early_stop_for_round(self, round_no: int) -> bool:
+        return self.s1_early_stop.enabled and round_no <= self.s1_early_stop.max_round
+
     async def compare(
         self,
         *,
@@ -108,6 +113,7 @@ class JudgeAgent(BaseAgent):
         gray_views_b: dict[str, bytes] | None = None,
         embeddings_a: bytes | None = None,
         embeddings_b: bytes | None = None,
+        early_stop: bool = False,
     ) -> JudgeVerdict:
         _t0 = time.monotonic()
         prompt_url = _data_url(reference_bytes, reference_mime)
@@ -142,6 +148,8 @@ class JudgeAgent(BaseAgent):
         )
 
         sem = asyncio.Semaphore(self.s1_concurrency)
+        # Pin this task's judge traffic to one replica (prefix-cache affinity); no-op for a plain client.
+        _affinity_key.set(task_id)
         winner, detail = await evaluate_duel(
             self.client,
             sem,
@@ -152,6 +160,7 @@ class JudgeAgent(BaseAgent):
             model=self.model,
             log_id=f"{task_id} {match_label}",
             max_stage=self.max_stage,
+            early_stop=self.s1_early_stop if early_stop else None,
         )
 
         if winner == "draw":

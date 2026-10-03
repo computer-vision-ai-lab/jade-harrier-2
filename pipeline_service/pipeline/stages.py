@@ -236,6 +236,7 @@ async def _resolve_bracket(
                 gray_views_b=right.judge_gray_views,
                 embeddings_a=left.judge_embeddings,
                 embeddings_b=right.judge_embeddings,
+                early_stop=judge.early_stop_for_round(round_no),
             )
         winner = left if verdict.winner == "A" else right
         _t_e = time.monotonic()
@@ -321,10 +322,15 @@ class _CandidateFactory:
         ensemble_temperature: float,
         seed_offset: int = 0,
         orientation: OrientationConfig | None = None,
+        candidate_deadline_s: float = 0.0,
     ) -> None:
         self.task = task
         self.seed_offset = seed_offset
         self.orientation = orientation or OrientationConfig()
+        # Absolute monotonic-free deadline: task.started_at is time.time() set by the orchestrator.
+        self.candidate_deadline_at = (
+            (task.started_at or time.time()) + candidate_deadline_s if candidate_deadline_s > 0 else None
+        )
         self.coder = coder
         self.judge = judge
         self.embedder = embedder
@@ -388,17 +394,30 @@ class _CandidateFactory:
         task = self.task
         cand = Candidate(k=k, seed=task.seed + self.seed_offset + k)
         t0 = time.time()
+        # Remaining wall-clock for this candidate, semaphore wait included: a candidate that
+        # cannot even start before the deadline is a walkover, so the bracket never waits on
+        # a wedged coder past candidate_deadline_s. None = unbounded (old behaviour).
+        remaining = None
+        if self.candidate_deadline_at is not None:
+            remaining = max(0.0, self.candidate_deadline_at - time.time())
         try:
-            async with stage_guard(task, f"coder#k{k}", self.sem_coder, self.status):
-                cand.js_code = await self.coder.code(
-                    task_id=task.stem,
-                    osd=self.osd,
-                    image_bytes=task.image_bytes if self.send_image else None,
-                    image_mime=task.image_mime,
-                    actor_override=f"coder#k{k}",
-                    seed_override=cand.seed,
-                    temperature_override=self.ensemble_temperature,
-                )
+            async with asyncio.timeout(remaining):
+                async with stage_guard(task, f"coder#k{k}", self.sem_coder, self.status):
+                    cand.js_code = await self.coder.code(
+                        task_id=task.stem,
+                        osd=self.osd,
+                        image_bytes=task.image_bytes if self.send_image else None,
+                        image_mime=task.image_mime,
+                        actor_override=f"coder#k{k}",
+                        seed_override=cand.seed,
+                        temperature_override=self.ensemble_temperature,
+                    )
+        except TimeoutError:
+            cand.drop_reason = "coder:deadline"
+            logger.warning(
+                f"[CANDIDATE DEADLINE] {task.stem} k{k} dropped after {time.time() - t0:.0f}s "
+                f"(candidate_deadline_s elapsed)"
+            )
         except StageError as exc:
             cand.drop_reason = f"coder:{type(exc.cause).__name__}"
         except Exception as exc:
@@ -491,6 +510,7 @@ async def multigen_first_iter(
     render_from_object: bool = False,
     seed_offset: int = 0,
     orientation: OrientationConfig | None = None,
+    candidate_deadline_s: float = 0.0,
 ) -> None:
     """K-of-N generation + judge bracket. Replaces code_and_check + renderer
     on iteration 0 when `coder.ensemble_size > 1`.
@@ -525,6 +545,7 @@ async def multigen_first_iter(
         ensemble_temperature=ensemble_temperature,
         seed_offset=seed_offset,
         orientation=orientation,
+        candidate_deadline_s=candidate_deadline_s,
     )
 
     # Launch every coder at once, then embed the reference while they run; each

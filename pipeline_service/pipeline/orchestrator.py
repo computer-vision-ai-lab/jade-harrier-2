@@ -47,6 +47,7 @@ class Pipeline:
         render_from_object: bool = False,
         seed_offset: int = 0,
         orientation: OrientationConfig | None = None,
+        candidate_deadline_s: float = 0.0,
         refinement_enabled: bool = True,
         planner_limit: int = 2,
         coder_limit: int = 2,
@@ -71,6 +72,7 @@ class Pipeline:
         self.render_from_object = render_from_object
         self.seed_offset = seed_offset
         self.orientation = orientation or OrientationConfig()
+        self.candidate_deadline_s = candidate_deadline_s
         self.refinement_enabled = refinement_enabled
 
         self.max_iter = max_iter
@@ -139,6 +141,7 @@ class Pipeline:
                     render_from_object=self.render_from_object,
                     seed_offset=self.seed_offset,
                     orientation=self.orientation,
+                    candidate_deadline_s=self.candidate_deadline_s,
                 )
             else:
                 # Next iterations without multigen (base coder, patcher and repair agent)

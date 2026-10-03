@@ -107,16 +107,16 @@ class GenerationPipeline:
             self._clients[name] = AsyncOpenAI(
                 base_url=cfg.base_url,
                 api_key=api_key,
-                # At large ensemble sizes the tail prompts' candidates wait behind the whole
-                # coder queue; a 900 s client timeout killed every candidate of the last prompts
-                # in a batch (APITimeoutError). The batch budget is the real deadline. Connect
-                # timeout 120 s so judge bursts retry instead of falling back to neutral.
-                timeout=httpx.Timeout(3600.0, connect=120.0),
+                # Per-endpoint read timeout (llm_clients.<name>.request_timeout_s). In-flight
+                # requests are capped by the actor worker semaphores, so this measures service
+                # time, not queue time; a hung vLLM request costs one candidate / one duel retry,
+                # not the prompt or the batch. Connect timeout 120 s so judge bursts retry.
+                timeout=httpx.Timeout(cfg.request_timeout_s, connect=120.0),
                 max_retries=0,
             )
             logger.info(
                 f"llm client ready | name={name} base_url={cfg.base_url} "
-                f"local={_is_local_endpoint(cfg.base_url)}"
+                f"local={_is_local_endpoint(cfg.base_url)} timeout={cfg.request_timeout_s:.0f}s"
             )
             self._client_urls[name] = cfg.base_url
             _instrument_client(name, self._clients[name])
@@ -211,8 +211,10 @@ class GenerationPipeline:
         async def run_one(task: PipelineTask) -> None:
             while True:
                 result = await (await self._pipeline.submit(task))
-                # Three attempts per prompt: a missing module is scored as a loss.
-                if not result.failed or task.attempt >= 2:
+                # Three attempts per prompt: a missing module is scored as a loss. A deadline
+                # failure is not retried: the retry would start a full K-candidate run after
+                # task_deadline_s and could only end at the batch budget.
+                if not result.failed or task.attempt >= 2 or result.failure_stage == "deadline":
                     self.state.record_task(result)
                     return
                 task = PipelineTask(
@@ -223,7 +225,11 @@ class GenerationPipeline:
 
         await self._diag_snapshot("start")
         try:
-            logger.info(f"[Batch starting] {len(tasks)} tasks | budget={budget:.0f}s")
+            logger.info(
+                f"[Batch starting] {len(tasks)} tasks | budget={budget:.0f}s "
+                f"(effective {budget - 120:.0f}s) | task_deadline={self.settings.event_bus.task_deadline_s:.0f}s "
+                f"| candidate_deadline={self.settings.pipeline.candidate_deadline_s:.0f}s"
+            )
             await asyncio.wait_for(
                 asyncio.gather(*(run_one(t) for t in tasks)),
                 timeout=budget-120,

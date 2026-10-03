@@ -58,6 +58,11 @@ class OrientationConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     batch_time_budget: float = 1800.0
+    # Wall-clock (from task start) after which a candidate that has not finished coding is
+    # dropped as a walkover, so the bracket completes on the candidates that exist. 0 = off.
+    # Must exceed a normal batch (tail candidates finish near batch end) and sit well inside
+    # event_bus.task_deadline_s.
+    candidate_deadline_s: float = 0.0
     prompt_timeout: float = 120.0
     use_planner: bool = True
     render_from_object: bool = False
@@ -119,6 +124,10 @@ class LLMClientConfig(BaseModel):
     api_key_env: str = ""
     api_key: str = ""
     enabled: bool = False
+    # httpx read timeout for one chat completion against this endpoint. Coder concurrency is
+    # capped by actors.coder.workers (no server-side queueing), so this bounds one request's
+    # service time; a request that exceeds it is dropped (one candidate), never retried.
+    request_timeout_s: float = 900.0
     vllm: VllmServeConfig | None = None
 
     @property
@@ -128,9 +137,20 @@ class LLMClientConfig(BaseModel):
         url = self.base_url.lower()
         return "vllm" if any(h in url for h in _LOCAL_HOSTS) else "openrouter"
 
+class S1EarlyStopConfig(BaseModel):
+    """Judge only: in bracket rounds R1..max_round, judge the S1 front angles one at a time and skip the rest once the
+    first ones agree (both side orders consistent, same side, gap wide enough)."""
+    enabled: bool = False
+    angles: int = Field(default=2, ge=1, le=4)
+    min_gap: float = Field(default=2.0, ge=0.0)
+    single_angle_min_gap: float = Field(default=2.5, ge=0.0)
+    max_round: int = Field(default=4, ge=1)
+
+
 class ActorConfig(BaseModel):
     """Per-actor config."""
     explain: bool = False  # judge only: run the opponent-independent 'explain' GLM call (fills detail['issues']; no effect on the verdict)
+    s1_early_stop: S1EarlyStopConfig = Field(default_factory=S1EarlyStopConfig)  # judge only
     max_stage: int = 4  # judge only: deepest multi-stage judge stage to run (1-4). 3 skips the S4 side guard (never changed a verdict in 543 logged duels)
 
     workers: int = 1
