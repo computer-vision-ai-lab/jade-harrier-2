@@ -4,8 +4,8 @@ api:
   debug: true
 
 pipeline:
-  batch_time_budget: 3000
-  candidate_deadline_s: 2100
+  batch_time_budget: 36000
+  candidate_deadline_s: 0
   prompt_timeout: 600.0
   use_planner: false
   render_from_object: true
@@ -182,7 +182,7 @@ actors:
 
 event_bus:
   max_iter: 2
-  task_deadline_s: 2700
+  task_deadline_s: 36000
   score_threshold: 0.55
 
 js_checker:
