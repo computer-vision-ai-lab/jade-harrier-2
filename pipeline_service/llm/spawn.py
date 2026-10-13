@@ -5,6 +5,9 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
+import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
@@ -301,9 +304,63 @@ def _bin_exists(path: str) -> bool:
     return shutil.which(path) is not None
 
 
+_READY_TIMEOUT_ENV = "VLLM_ENGINE_READY_TIMEOUT_S"
+_DEFAULT_READY_TIMEOUT_S = "3600"
+_SUPERVISE_S = int(os.environ.get("VLLM_SPAWN_SUPERVISE_S", "2700"))
+_MAX_RESTARTS = int(os.environ.get("VLLM_SPAWN_MAX_RESTARTS", "2"))
+
+
+def _is_hf_repo(model: str) -> bool:
+    return "/" in model and not os.path.exists(model)
+
+
+def _prefetch_models(jobs: list[VllmJob]) -> None:
+    """Download every distinct (model, revision) into the HF cache before any vLLM process starts, so engine start-up never
+    waits on the network. Skipped when HF_HUB_OFFLINE is set; a failed download is logged and left to vLLM itself."""
+    if os.environ.get("HF_HUB_OFFLINE", "").strip() in ("1", "true", "yes"):
+        return
+    try:
+        from huggingface_hub import snapshot_download
+    except Exception as e:  # noqa: BLE001
+        print(f"[vllm-spawn] prefetch skipped (huggingface_hub unavailable: {e})", flush=True)
+        return
+    targets = {(j.model, j.revision) for j in jobs if _is_hf_repo(j.model)}
+    if not targets:
+        return
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    results: dict[tuple[str, str | None], str] = {}
+
+    def one(model: str, rev: str | None) -> None:
+        t0 = time.time()
+        try:
+            path = snapshot_download(model, revision=rev, max_workers=8)
+            results[(model, rev)] = f"ok {time.time() - t0:.0f}s -> {path}"
+        except Exception as e:  # noqa: BLE001
+            results[(model, rev)] = f"FAILED after {time.time() - t0:.0f}s: {type(e).__name__}: {str(e).splitlines()[0][:120]}"
+
+    print(f"[vllm-spawn] prefetching {len(targets)} model(s): " + ", ".join(f"{m}@{r or 'main'}" for m, r in sorted(targets)), flush=True)
+    threads = [threading.Thread(target=one, args=t, daemon=True) for t in sorted(targets)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for (m, r), msg in sorted(results.items()):
+        print(f"[vllm-spawn] prefetch {m}@{r or 'main'}: {msg}", flush=True)
+
+
+def _healthy(job: VllmJob) -> bool:
+    req = urllib.request.Request(f"http://127.0.0.1:{job.port}/v1/models", headers={"Authorization": f"Bearer {job.api_key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=3) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _spawn_one(job: VllmJob) -> subprocess.Popen:
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = job.gpu_ids
+    env.setdefault(_READY_TIMEOUT_ENV, _DEFAULT_READY_TIMEOUT_S)
     cmd = _build_cmd(job)
     print(
         f"[vllm-spawn] Starting vLLM Client: {job.name} | Model: {job.model} | "
@@ -341,7 +398,10 @@ def main() -> int:
     # Spawn each job independently: a missing binary or launch failure for one
     # client must NOT abort the others (e.g. GLM env not built yet should still
     # let the coder come up).
+    runnable = [j for j in jobs if _bin_exists(j.vllm_bin)]
+    _prefetch_models(runnable)
     failures = 0
+    procs: dict[str, subprocess.Popen] = {}
     for j in jobs:
         if not _bin_exists(j.vllm_bin):
             print(
@@ -353,7 +413,7 @@ def main() -> int:
             failures += 1
             continue
         try:
-            _spawn_one(j)
+            procs[j.name] = _spawn_one(j)
         except Exception as e:  # noqa: BLE001 - one client's failure must not kill the rest
             print(f"[vllm-spawn] ERROR {j.name}: spawn failed: {e}", file=sys.stderr)
             failures += 1
@@ -363,7 +423,41 @@ def main() -> int:
         f"[vllm-spawn] {launched}/{len(jobs)} vLLM instances launched in background",
         flush=True,
     )
+    _supervise({j.name: j for j in jobs if j.name in procs}, procs)
     return 1 if failures else 0
+
+
+def _supervise(jobs: dict[str, VllmJob], procs: dict[str, subprocess.Popen]) -> None:
+    """Until every instance answers /v1/models (or the budget runs out): restart an instance whose process exited before
+    becoming healthy, at most _MAX_RESTARTS times each."""
+    restarts = {n: 0 for n in procs}
+    healthy: set[str] = set()
+    t0 = time.time()
+    while procs and len(healthy) < len(procs) and time.time() - t0 < _SUPERVISE_S:
+        time.sleep(10)
+        for name, p in list(procs.items()):
+            if name in healthy:
+                continue
+            if _healthy(jobs[name]):
+                healthy.add(name)
+                print(f"[vllm-spawn] {name} healthy after {time.time() - t0:.0f}s", flush=True)
+                continue
+            rc = p.poll()
+            if rc is None:
+                continue
+            if restarts[name] >= _MAX_RESTARTS:
+                print(f"[vllm-spawn] ERROR {name}: exited with code {rc} and restart budget exhausted", file=sys.stderr, flush=True)
+                healthy.add(name)  # stop watching it
+                continue
+            restarts[name] += 1
+            print(f"[vllm-spawn] {name} exited with code {rc} before becoming healthy — restart {restarts[name]}/{_MAX_RESTARTS}", flush=True)
+            try:
+                procs[name] = _spawn_one(jobs[name])
+            except Exception as e:  # noqa: BLE001
+                print(f"[vllm-spawn] ERROR {name}: restart failed: {e}", file=sys.stderr, flush=True)
+    pending = [n for n in procs if n not in healthy]
+    if pending:
+        print(f"[vllm-spawn] supervision ended after {time.time() - t0:.0f}s; not yet healthy: {pending}", flush=True)
 
 
 if __name__ == "__main__":
