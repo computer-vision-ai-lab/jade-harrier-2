@@ -10,6 +10,7 @@ from openai import AsyncOpenAI
 
 from config.settings import LLMClientConfig, SettingsConf
 from logger_config import logger
+from llm.mm_resend import install_mm_resend  # judge image resend (tail/deep/gdnk/judge)
 from modules.js_checker.module import JSCheckerModule
 from modules.renderer.module import RendererModule
 from pipeline.factory import build_pipeline
@@ -17,6 +18,7 @@ from pipeline.batch_stats import STATS
 from pipeline.orchestrator import Pipeline
 from pipeline.state import MinerState
 from pipeline.task import PipelineTask
+from llm import burst as _burst
 
 _PLACEHOLDER_KEYS = {"", "placeholder", "your-key-here", "sk-or-...", "changeme"}
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "0.0.0.0")
@@ -98,6 +100,8 @@ class GenerationPipeline:
     async def startup(self) -> None:
         logger.info("GenerationPipeline starting")
 
+        _judge = self.settings.actors.judge  # judge image resend (tail/deep/gdnk/judge)
+        _judge_names = {_judge.client, *getattr(_judge, "extra_clients", [])}
         for name, cfg in self.settings.llm_clients.items():
             if not cfg.enabled:
                 continue
@@ -119,6 +123,8 @@ class GenerationPipeline:
                 f"local={_is_local_endpoint(cfg.base_url)} timeout={cfg.request_timeout_s:.0f}s"
             )
             self._client_urls[name] = cfg.base_url
+            if name in _judge_names and install_mm_resend(self._clients[name], name=name):  # judge image resend (tail/deep/gdnk/judge)
+                logger.info(f"llm client {name}: judge images sent once, then by uuid (JUDGE_IMG_UUID=0 disables)")
             _instrument_client(name, self._clients[name])
         actors = self.settings.actors
         _roles: dict[str, str] = {}
@@ -141,6 +147,23 @@ class GenerationPipeline:
         )
         await self._pipeline.start()
         actors = self.settings.actors
+        _jname = actors.judge.client
+        _jcfg = self.settings.llm_clients.get(_jname)
+
+        def _burst_client(name: str, url: str) -> AsyncOpenAI:
+            c = AsyncOpenAI(base_url=url, api_key=_resolve_api_key(_jname, _jcfg) or "local",
+                            timeout=httpx.Timeout(_jcfg.request_timeout_s, connect=120.0), max_retries=0)
+            if install_mm_resend(c, name=name):  # judge image resend (tail/deep/gdnk/judge) (burst GLM replica)
+                logger.info(f"llm client {name}: burst judge images sent once, then by uuid")
+            _instrument_client(name, c)
+            self._clients[name] = c
+            self._client_urls[name] = url
+            STATS.roles[name] = "judge"
+            return c
+
+        if self._pipeline.judge is not None and _jcfg is not None:
+            _burst.SETTINGS = self.settings
+            _burst.setup(self._pipeline, self._pipeline.judge.client, _burst_client)
         eb = self.settings.event_bus
         use_planner = self.settings.pipeline.use_planner
         logger.info(f"[Pipeline initialized — waiting for models]")
@@ -216,6 +239,8 @@ class GenerationPipeline:
                 # task_deadline_s and could only end at the batch budget.
                 if not result.failed or task.attempt >= 2 or result.failure_stage == "deadline":
                     self.state.record_task(result)
+                    if _burst.CTRL:
+                        _burst.CTRL.task_done(task.stem)
                     return
                 task = PipelineTask(
                     stem=task.stem, image_url=task.image_url, seed=task.seed,
@@ -223,6 +248,8 @@ class GenerationPipeline:
                 task.attempt = result.attempt + 1
                 logger.info(f"[Batch retry] {task.stem} | attempt={task.attempt}")
 
+        if _burst.CTRL:
+            _burst.CTRL.batch_start(len(tasks), [t.stem for t in tasks])
         await self._diag_snapshot("start")
         try:
             logger.info(
@@ -249,6 +276,8 @@ class GenerationPipeline:
             raise
         finally:
             STATS.end()
+            if _burst.CTRL:
+                _burst.CTRL.batch_end()
             await self._diag_snapshot("end")
             self._cleanup_batch_memory("Batch")
             logger.info(
@@ -353,6 +382,8 @@ class GenerationPipeline:
             return
         try:
             logger.info(f"[Warmup task starting]")
+            if _burst.CTRL:
+                _burst.CTRL.batch_start(1, [task.stem])
             future = await self._pipeline.submit(task)
             result = await future
             if getattr(result, "failed", False):
@@ -369,4 +400,7 @@ class GenerationPipeline:
             logger.exception(f"[Warmup failed] {exc}")
             raise
         finally:
+            if _burst.CTRL:
+                _burst.CTRL.batch_end()
+                await _burst.CTRL.ensure_coder("warm-up end")   # untimed: batch 1 starts with the coder awake
             self._cleanup_batch_memory("Warmup")

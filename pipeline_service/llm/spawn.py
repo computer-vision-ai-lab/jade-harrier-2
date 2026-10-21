@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,11 @@ class VllmJob:
     reasoning_parser: str | None
     extra_args: tuple[str, ...]
     dp: int = 1
+    # speculative draft model (config `vllm.speculative`): prefetched + pinned like the target; see _build_cmd
+    spec_method: str | None = None
+    spec_model: str | None = None
+    spec_revision: str | None = None
+    spec_tokens: int = 0
 
 
 @dataclass
@@ -62,6 +68,10 @@ class _RawSpec:
     reasoning_parser: str | None
     extra_args: tuple[str, ...]
     data_parallel: int = 1
+    spec_method: str | None = None
+    spec_model: str | None = None
+    spec_revision: str | None = None
+    spec_tokens: int = 0
 
 # Check if the URL is a local host
 def _is_local(url: str | None) -> bool:
@@ -142,8 +152,28 @@ def _collect_raw_specs(cfg: dict[str, Any]) -> list[_RawSpec]:
             ),
             extra_args=tuple(str(x) for x in (v.get("extra_args") or [])),
             data_parallel=int(v.get("data_parallel_size", 1) or 1),
+            **_parse_speculative(v.get("speculative")),
         ))
     return specs
+
+
+def _parse_speculative(raw: Any) -> dict[str, Any]:
+    """`vllm.speculative: {method, model, revision, num_speculative_tokens}` -> --speculative-config built by _build_cmd.
+    `model` is an HF repo pinned by `revision` (prefetched with the target so start-up never waits on the network and the
+    draft bytes are fixed for the audit); `method` without `model` (mtp) needs no download."""
+    if not isinstance(raw, dict):
+        return {}
+    method = str(raw.get("method") or "").strip()
+    if not method:
+        return {}
+    model = str(raw.get("model") or "").strip() or None
+    rev = raw.get("revision")
+    return {
+        "spec_method": method,
+        "spec_model": model,
+        "spec_revision": (str(rev).strip() or None) if rev is not None else None,
+        "spec_tokens": int(raw.get("num_speculative_tokens") or 0),
+    }
 
 
 # Allocate the GPUs to the specifications
@@ -242,6 +272,7 @@ def _finalize_jobs(specs: list[_RawSpec], assigned: dict[str, list[str]]) -> lis
             max_seqs=s.max_seqs, api_key=s.api_key,
             vllm_bin=s.vllm_bin, trust_remote_code=s.trust_remote_code,
             reasoning_parser=s.reasoning_parser, extra_args=s.extra_args,
+            spec_method=s.spec_method, spec_model=s.spec_model, spec_revision=s.spec_revision, spec_tokens=s.spec_tokens,
         ))
     return jobs
 
@@ -293,8 +324,37 @@ def _build_cmd(job: VllmJob) -> list[str]:
         cmd += ["--reasoning-parser", job.reasoning_parser]
     if job.trust_remote_code:
         cmd.append("--trust-remote-code")
+    spec = _speculative_config(job)
+    if spec:
+        cmd += ["--speculative-config", spec]
     cmd += list(job.extra_args)
     return cmd
+
+
+def _speculative_config(job: VllmJob) -> str | None:
+    """JSON for --speculative-config from the `vllm.speculative` block. A draft repo is referenced by its LOCAL snapshot
+    path (the prefetch put revision `spec_revision` there), so vLLM never resolves `main` behind our back."""
+    if not job.spec_method:
+        return None
+    cfg: dict[str, Any] = {"method": job.spec_method}
+    if job.spec_tokens > 0:
+        cfg["num_speculative_tokens"] = job.spec_tokens
+    if job.spec_model:
+        cfg["model"] = _local_snapshot(job.spec_model, job.spec_revision) or job.spec_model
+        if job.spec_revision and "model" in cfg and cfg["model"] == job.spec_model:
+            cfg["revision"] = job.spec_revision
+    return json.dumps(cfg, separators=(",", ":"))
+
+
+def _local_snapshot(model: str, revision: str | None) -> str | None:
+    """HF-cache snapshot dir of (model, revision) if it is already downloaded (by _prefetch_models or earlier), else None."""
+    if not _is_hf_repo(model):
+        return model if os.path.exists(model) else None
+    try:
+        from huggingface_hub import snapshot_download
+        return snapshot_download(model, revision=revision, local_files_only=True)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _bin_exists(path: str) -> bool:
@@ -325,6 +385,7 @@ def _prefetch_models(jobs: list[VllmJob]) -> None:
         print(f"[vllm-spawn] prefetch skipped (huggingface_hub unavailable: {e})", flush=True)
         return
     targets = {(j.model, j.revision) for j in jobs if _is_hf_repo(j.model)}
+    targets |= {(j.spec_model, j.spec_revision) for j in jobs if j.spec_model and _is_hf_repo(j.spec_model)}
     if not targets:
         return
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")

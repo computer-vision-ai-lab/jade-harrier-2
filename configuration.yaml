@@ -42,16 +42,28 @@ llm_clients:
     api_key: "local"
     request_timeout_s: 900
     vllm:
-      model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
-      revision: "14adb741b473bbd7bc0d02cacb27247d2cb707f6"
+      model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane"
+      revision: "ffdf2798befae9eb6cb32ba9983afb99d3215bcd"
       gpu_ids: "0,1"
       tensor_parallel_size: 1
       data_parallel_size: 2
+      # scripts/burst/vllm_shim.sh = the coder vLLM (+ --enable-sleep-mode) behind a least-in-flight proxy on :8001, with one
+      # sleeping GLM judge per coder GPU (:8031, :8032) that llm/burst.py wakes for the judge-only tail of each batch;
+      # "--burst-glm <util>" is the GLM's memory share at its start (it sleeps to ~2 GB before the coder starts).
+      # Drop --burst-glm (or set BURST_GLM_URLS="") for the plain coder.
       vllm_bin: "/opt/vllm-coder-env/bin/vllm"
       gpu_memory_utilization: 0.9
       max_model_len: 81920
       max_num_seqs: 256
-      extra_args: ["--speculative-config", "{\"method\":\"mtp\",\"num_speculative_tokens\":2}"]
+      # DFlash speculative decoding (vLLM >= 0.28; run.sh builds the coder env with CODER_VLLM_VERSION=0.32.0): the draft is
+      # prefetched and pinned by revision like the target (llm/spawn.py). Measured: accept length 6.4,
+      # 1.8-1.9x the MTP k=2 throughput at C8-16 (H100), 1.9x at C32 (H200).
+      speculative:
+        method: "dflash"
+        model: "cont1037/Qwen-3.6-27B-AmberKite-DFlash"
+        revision: "285795f0143bcb7a35efc4647a70bff22bb90b47"
+        num_speculative_tokens: 7
+      extra_args: []
   judge-critic-instance:
     enabled: true
     base_url: "http://localhost:8002/v1"
@@ -63,11 +75,11 @@ llm_clients:
       gpu_ids: "2"
       tensor_parallel_size: 1
       data_parallel_size: 1
-      gpu_memory_utilization: 0.9
+      gpu_memory_utilization: 0.81
       max_model_len: 81920
       max_num_seqs: 64
       extra_args: ["--max-num-batched-tokens", "16384"]
-      vllm_bin: "/opt/vllm-glm-env/bin/vllm"
+      vllm_bin: "/workspace/scripts/judgefast/vllm_enc.sh"
       trust_remote_code: true
       reasoning_parser: null
   judge-critic-instance-b:
@@ -81,11 +93,11 @@ llm_clients:
       gpu_ids: "3"
       tensor_parallel_size: 1
       data_parallel_size: 1
-      gpu_memory_utilization: 0.9
+      gpu_memory_utilization: 0.81
       max_model_len: 81920
       max_num_seqs: 64
       extra_args: ["--max-num-batched-tokens", "16384"]
-      vllm_bin: "/opt/vllm-glm-env/bin/vllm"
+      vllm_bin: "/workspace/scripts/judgefast/vllm_enc.sh"
       trust_remote_code: true
       reasoning_parser: null
 
@@ -96,7 +108,7 @@ embedder:
 actors:
   planner:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
+    model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane"
     workers: 256
     queue_size: 128
     max_tokens: 32768
@@ -114,7 +126,7 @@ actors:
       allow_fallbacks: true
   coder:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-AmberKite"
+    model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane"
     workers: 96
     queue_size: 64
     max_tokens: 24576
@@ -127,7 +139,7 @@ actors:
     seed: 42
     enable_thinking: false
     multimodal: true
-    ensemble_size: 46
+    ensemble_size: 58
     ensemble_temperature: 0.7
     providers:
       order: []

@@ -16,6 +16,7 @@ from utils.http import download_image
 
 
 from pipeline.batch_stats import STATS
+from llm import burst as _burst
 
 
 class StageError(Exception):
@@ -349,6 +350,7 @@ class _CandidateFactory:
 
     def start_coders(self, k_count: int) -> dict[int, asyncio.Task]:
         """Launch one coder per candidate at once (sem_coder caps concurrency)."""
+        self._burst_gen = _burst.CTRL.coder_begin(k_count, self.task.stem) if _burst.CTRL else 0
         self._coder_tasks = {
             k: asyncio.create_task(self._generate(k)) for k in range(k_count)
         }
@@ -391,6 +393,13 @@ class _CandidateFactory:
         return cand if _is_live(cand) else None
 
     async def _generate(self, k: int) -> Candidate:
+        try:
+            return await self._generate_inner(k)
+        finally:
+            if _burst.CTRL:
+                _burst.CTRL.coder_end(getattr(self, "_burst_gen", 0))
+
+    async def _generate_inner(self, k: int) -> Candidate:
         task = self.task
         cand = Candidate(k=k, seed=task.seed + self.seed_offset + k)
         t0 = time.time()
@@ -403,6 +412,8 @@ class _CandidateFactory:
         try:
             async with asyncio.timeout(remaining):
                 async with stage_guard(task, f"coder#k{k}", self.sem_coder, self.status):
+                    if _burst.CTRL:
+                        await _burst.CTRL.ensure_coder()
                     cand.js_code = await self.coder.code(
                         task_id=task.stem,
                         osd=self.osd,
