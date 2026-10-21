@@ -61,7 +61,7 @@ llm_clients:
       speculative:
         method: "dflash"
         model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane-DFlash"
-        revision: "846b48c91437c5ba295dae9a42e7b39d78b9230e"
+        revision: "aa8a895959c6e4e48eb5a2bf1044f727932fed3d"
         num_speculative_tokens: 7
       extra_args: []
   judge-critic-instance:
