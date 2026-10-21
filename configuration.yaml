@@ -60,8 +60,8 @@ llm_clients:
       # 1.8-1.9x the MTP k=2 throughput at C8-16 (H100), 1.9x at C32 (H200).
       speculative:
         method: "dflash"
-        model: "cont1037/Qwen-3.6-27B-AmberKite-DFlash"
-        revision: "285795f0143bcb7a35efc4647a70bff22bb90b47"
+        model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane-DFlash"
+        revision: "846b48c91437c5ba295dae9a42e7b39d78b9230e"
         num_speculative_tokens: 7
       extra_args: []
   judge-critic-instance:
