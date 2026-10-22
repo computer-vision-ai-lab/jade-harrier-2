@@ -126,7 +126,7 @@ PY
         echo "=== STAGE 2.6: building coder vLLM env $CODER_VLLM_VERSION ($CODER_VLLM_BIN missing) ==="
         echo "[run.sh] coder env build target: $CODER_MODEL @ ${CODER_REVISION:-main}"
         VENV="$(dirname "$(dirname "$CODER_VLLM_BIN")")" \
-        VLLM_VERSION="$CODER_VLLM_VERSION" \
+        VLLM_VERSION="$CODER_VLLM_VERSION" TORCH_BACKEND="${CODER_TORCH_BACKEND:-cu129}" \
         MODEL="$CODER_MODEL" MODEL_REVISION="$CODER_REVISION" \
             bash "$SCRIPT_DIR/scripts/setup_glm_vllm_env.sh" \
             || echo "[run.sh] coder env setup failed — the coder cannot start without $CODER_VLLM_BIN; check logs" >&2
