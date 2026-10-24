@@ -220,6 +220,12 @@ class Pipeline:
             task.failure_stage = "deadline"
             self.task_status[task.stem] = "failed"
             logger.warning(f"[DEADLINE] {task.stem} exceeded {self.task_deadline_s}s")
+            try:   # [R96 pgh17d] PGH_DEADLINE_SALVAGE=1: ship the best draft so far instead of nothing (image default 1)
+                import pgh_salvage as _salv
+                if _salv.ON:
+                    _salv.salvage(task, "task_deadline", log=logger.warning, status=self.task_status)
+            except Exception as exc:
+                logger.warning(f"[SALVAGE] {task.stem} hook failed: {exc!r}")
 
         except StageError as exc:
             task.failed = True

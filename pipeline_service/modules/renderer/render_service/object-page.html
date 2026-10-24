@@ -30,6 +30,9 @@ let envRT = null;
 let _imgSize = null;
 let _camFovDeg = null;
 let _lighting = null;
+// [jgrid] one rig + PMREM environment per lighting, built once per page and kept while the page lives (a PMREM
+// build costs ~5 s / ~20 CPU-s on SwiftShader). Off mode only ever builds 'neutral', exactly as before.
+const _rigs = {};
 
 function buildFollowRig() {
   const rig = new THREE.Group();
@@ -124,29 +127,7 @@ function ensureContext(params) {
     camera.up.set(0, 1, 0);
   }
 
-  if (_lighting !== params.lighting) {
-    if (lightRig !== null) {
-      scene.remove(lightRig);
-      // Dispose the PMREM render target, not just its texture, or the FBO
-      // leaks on this warm page. 'follow' has no environment, so the pointer
-      // must be cleared explicitly or the renderer keeps sampling the
-      // disposed texture.
-      if (envRT !== null) {
-        envRT.dispose();
-        envRT = null;
-      }
-      scene.environment = null;
-      scene.environmentIntensity = 1;
-      followLight = null;
-    }
-    lightRig = buildLightRig(params.lighting);
-    scene.add(lightRig);
-    // Mirrors render-pool.js 'neutral': exposure calibrated so an 18% grey
-    // card reads middle grey (~118 sRGB). Mode-scoped, so it must track the
-    // lighting switch on this warm page.
-    renderer.toneMappingExposure = params.lighting === 'neutral' ? 1.32 : 1.0;
-    _lighting = params.lighting;
-  }
+  setLighting(params.lightings ? (params.lightings[0] || params.lighting) : params.lighting);  // [jgrid] first view's
 
   if (_imgSize !== params.imgSize) {
     renderer.setSize(params.imgSize, params.imgSize);
@@ -158,6 +139,38 @@ function ensureContext(params) {
     _camFovDeg = params.camFovDeg;
   }
   scene.background = new THREE.Color(params.bgColor ? `#${params.bgColor}` : 0xffffff);
+}
+
+// [jgrid] the lighting switch of ensureContext as a function (renderView switches per view). A lighting seen before
+// on this page reuses its cached rig + environment (no PMREM build); cached render targets are never disposed, so
+// the environment pointer stays valid. The first build of each lighting runs the original code path unchanged.
+function setLighting(lighting) {
+  if (_lighting !== lighting) {
+    if (lightRig !== null) {
+      scene.remove(lightRig);
+      scene.environment = null;
+      scene.environmentIntensity = 1;
+      followLight = null;
+    }
+    const cached = _rigs[lighting];
+    if (cached) {
+      lightRig = cached.rig;
+      envRT = cached.envRT;
+      scene.environment = cached.envRT ? cached.envRT.texture : null;
+      scene.environmentIntensity = cached.envI;
+      followLight = cached.follow;
+    } else {
+      envRT = null;
+      lightRig = buildLightRig(lighting);
+      _rigs[lighting] = { rig: lightRig, envRT, envI: scene.environmentIntensity, follow: followLight };
+    }
+    scene.add(lightRig);
+    // Mirrors render-pool.js 'neutral': exposure calibrated so an 18% grey
+    // card reads middle grey (~118 sRGB). Mode-scoped, so it must track the
+    // lighting switch on this warm page.
+    renderer.toneMappingExposure = lighting === 'neutral' ? 1.32 : 1.0;
+    _lighting = lighting;
+  }
 }
 
 function sphericalToCartesian(thetaDeg, phiDeg, radius) {
@@ -222,6 +235,9 @@ function withParsedRoot(json, params, render) {
 }
 
 function renderView(i, params) {
+  if (params.lightings) setLighting(params.lightings[i] || params.lighting);  // [jgrid] before size, as in ensureContext
+  const __sz = params.sizes && params.sizes[i] ? params.sizes[i] : params.imgSize;
+  if (__sz !== _imgSize) { renderer.setSize(__sz, __sz); _imgSize = __sz; }
   if (params.bgs) {
     const bg = params.bgs[i] || params.bgColor;
     scene.background = new THREE.Color(bg ? `#${bg}` : 0xffffff);
@@ -244,7 +260,15 @@ window.__renderViews = function (json, params) {
         renderView(i, params);
         images.push(renderer.domElement.toDataURL('image/png'));
       }
-      return { data: images };
+      // PIN: one extra use per program, so material disposal never destroys it (bounded at 256).
+      // [sws] kernel-optim measured this snippet (= patch_object_page.py --pin) with sws-llvm: pixels identical, LLVM
+      // shader recompiles mostly gone. Off only when params.pin === false (sidecar env PGH_RENDER_PIN=0, renderer.js).
+      if (params.pin !== false) {
+        for (const p of renderer.info.programs) {
+          if (!p.__pinned && renderer.info.programs.length <= 256) { p.__pinned = true; p.usedTimes++; }
+        }
+      }
+      return params.lightings ? { data: images, lightings_applied: true } : { data: images };  // [jgrid] F4
     });
   } catch (err) {
     return { error: err.message || String(err) };

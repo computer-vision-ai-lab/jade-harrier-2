@@ -17,10 +17,16 @@ GRID_VIEWS: tuple[tuple[float, float], ...] = (
 )
 GRID_KEYS: tuple[str, ...] = tuple(f"grid_{i}" for i in range(len(GRID_VIEWS)))
 
+# [jgrid] filter for downscale=True (1024 px tiles -> 518 px). The contest never resizes (it renders 518 natively);
+# HAMMING = closest to a native 518 render on 24 real :8017 drafts (96/96 tiles beat BOX; jgrid/bytecheck/summary.txt).
+DOWNSCALE_FILTER = Image.Resampling.HAMMING
 
-def compose_grid(tiles: Sequence[bytes], *, img_size: int, gap: int) -> bytes:
+
+def compose_grid(tiles: Sequence[bytes], *, img_size: int, gap: int, downscale: bool = False) -> bytes:
     """Compose PNG tiles row-major onto opaque black with ``gap`` px gutters;
-    alpha_composite mirrors drawImage's source-over for alpha < 255 tiles."""
+    alpha_composite mirrors drawImage's source-over for alpha < 255 tiles.
+    [jgrid] downscale=True: a square tile LARGER than img_size is resized to img_size (code render path ignores
+    per-view sizes); smaller or non-square tiles still raise. downscale=False is today's strict behaviour."""
     n = len(tiles)
     cols = math.ceil(math.sqrt(n))
     rows = math.ceil(n / cols)
@@ -30,6 +36,8 @@ def compose_grid(tiles: Sequence[bytes], *, img_size: int, gap: int) -> bytes:
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 255))
     for i, tile_bytes in enumerate(tiles):
         tile = Image.open(io.BytesIO(tile_bytes))
+        if downscale and tile.size[0] == tile.size[1] and tile.size[0] > img_size:
+            tile = tile.convert("RGBA").resize((img_size, img_size), DOWNSCALE_FILTER)
         if tile.size != (img_size, img_size):
             raise ValueError(
                 f"grid tile {i} is {tile.size[0]}x{tile.size[1]}, expected {img_size}x{img_size}"

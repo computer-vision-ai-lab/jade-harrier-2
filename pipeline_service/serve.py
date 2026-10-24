@@ -128,6 +128,8 @@ def _diag_header() -> str:
         f"wall={wall if wall is not None else '?'}",
         f"seed={state.seed}",
     ]
+    if "k" in d:  # [pgh1v3] set only by adaptive_k.apply (PGH_ADAPTIVE_K=1)
+        parts.append(f"k={d['k']}/{d.get('k_src', '?')}")
     # where the pod runs (preflight.region_info) + the batch's three-axis accounting (pipeline.batch_stats)
     parts += [f"{k}={d[k]}" for k in ("dc", "geo", "asn", "org", "pod", "rp_cpus") if d.get(k)]
     parts += STATS.header_parts()

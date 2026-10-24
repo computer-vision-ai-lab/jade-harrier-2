@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import os
 from enum import Enum
 
 from PIL import Image
@@ -68,6 +69,26 @@ _TOP_DOWN_YAW: dict[int, str] = {
 _IMAGE_ROTATIONS = (90, 180, 270)
 
 
+def _side_min_margin() -> float:
+    """[orient_gate] PGH_ORIENT_MIN_MARGIN: turn a side-best draft only when m = s_side - max(s_front, s_back) >= it.
+    Unset, empty, 0, negative, > 1, nan or garbage -> 0.0 = today's behaviour (every side-best draft is turned)."""
+    try:
+        tau = float(os.environ.get("PGH_ORIENT_MIN_MARGIN", "") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return tau if 0.0 < tau <= 1.0 else 0.0
+
+
+def _side_margin(sims: dict[str, float], best: ProbeView) -> float | None:
+    """m = s_best_side - max(s_front, s_back); None when a needed similarity is missing or not a finite number."""
+    try:
+        side, front, back = (float(sims[k]) for k in (best.value, ProbeView.FRONT.value, ProbeView.BACK.value))
+    except (KeyError, TypeError, ValueError):
+        return None
+    m = side - max(front, back)
+    return m if m == m and abs(m) != float("inf") else None
+
+
 def _rotated_png(png: bytes, degrees: int) -> bytes:
     with Image.open(io.BytesIO(png)) as img:
         out = io.BytesIO()
@@ -101,6 +122,11 @@ async def _decide(embedder, ref_vec, views: dict[str, bytes]) -> tuple[dict[str,
     if best is ProbeView.BACK:
         return sims, None
     if best in _SIDE_YAW:
+        tau = _side_min_margin()
+        if tau > 0.0:   # [orient_gate] weak side evidence -> keep the coder's own draft (missing sims: turn as today)
+            m = _side_margin(sims, best)
+            if m is not None and m < tau - 1e-9:   # 1e-9: m == tau up to float noise still turns
+                return sims, None
         return sims, Rotation(
             best_view=best,
             steps=[RotationStep(axis=RotationAxis.Y, angle_expr=_SIDE_YAW[best])],
@@ -123,7 +149,50 @@ async def _decide(embedder, ref_vec, views: dict[str, bytes]) -> tuple[dict[str,
     return sims, Rotation(best_view=best, steps=steps, image_rotation_deg=image_deg)
 
 
-async def orient_task(
+_SPEC_RATE: dict[str, list[int]] = {}   # [patch_loop] edit 10: prompt -> [rotated, decided] drafts so far
+_SPEC_PRIOR, _SPEC_PRIOR_N = 0.32, 4.0
+
+
+def _spec_prompt(stem: str) -> str:
+    return stem.split("#", 1)[0]
+
+
+def _spec_on(task: PipelineTask, renderer) -> bool:
+    """SPEC_FINAL=1, a scene_json render (per-view sizes need object-page.html) and the prompt's running rotation
+    rate (prior 0.32 as 4 drafts) below SPEC_FINAL_MAX_RATE (default 0.4)."""
+    if os.environ.get("SPEC_FINAL") != "1" or task.scene_json is None or not hasattr(renderer, "render_views_spec"):
+        return False
+    if not getattr(getattr(renderer, "config", None), "judge_multiview", False):   # review: no judge views -> no reuse
+        return False
+    try:
+        max_rate = float(os.environ.get("SPEC_FINAL_MAX_RATE", "0.4"))
+    except ValueError:
+        max_rate = 0.4
+    rot, n = _SPEC_RATE.get(_spec_prompt(task.stem), (0, 0))
+    return (rot + _SPEC_PRIOR * _SPEC_PRIOR_N) / (n + _SPEC_PRIOR_N) < max_rate
+
+
+async def orient_task(task: PipelineTask, **kwargs) -> OrientationResult:
+    """[patch_loop] edit 10: the leader's orient_task (below). SPEC_FINAL=1: the speculative final kept by the probe
+    survives only a "no rotation" decision (task untouched); every other outcome, exception or cancellation drops it.
+    Each decided draft updates its prompt's rotation rate."""
+    if os.environ.get("SPEC_FINAL") != "1":
+        return await _orient_task_leader(task, **kwargs)
+    try:
+        res = await _orient_task_leader(task, **kwargs)
+    except BaseException:
+        task.__dict__.pop("_spec_final", None)
+        raise
+    if res.reason != "already_front":
+        task.__dict__.pop("_spec_final", None)
+    if res.reason == "already_front" or res.rotation is not None:
+        st = _SPEC_RATE.setdefault(_spec_prompt(task.stem), [0, 0])
+        st[0] += res.rotation is not None
+        st[1] += 1
+    return res
+
+
+async def _orient_task_leader(
     task: PipelineTask,
     *,
     renderer,
@@ -147,9 +216,14 @@ async def orient_task(
     check_guard = sem_check if sem_check is not None else contextlib.nullcontext()
 
     async with render_guard:
-        views = await renderer.render_views(
-            task, [v.value for v in ProbeView], img_size=config.img_size
-        )
+        if _spec_on(task, renderer):   # [patch_loop] edit 10 (SPEC_FINAL=1): probe + unrotated final, one request
+            views = await renderer.render_views_spec(
+                task, [v.value for v in ProbeView], img_size=config.img_size
+            )
+        else:
+            views = await renderer.render_views(
+                task, [v.value for v in ProbeView], img_size=config.img_size
+            )
     if not views:
         return OrientationResult(reason="probe_failed")
 
@@ -159,9 +233,18 @@ async def orient_task(
         logger.warning(f"[ORIENT] '{task.stem}' decision failed: {type(exc).__name__}: {exc}")
         return OrientationResult(reason="decision_failed")
 
+    try:  # [patch_loop] edit 9, logging only: probe similarities (offline: rotation margin O3, loser pre-filter)
+        logger.info(f"[ORIENT_SIMS] '{task.stem}' " + __import__("json").dumps(
+            {str(getattr(k, "value", k)): round(float(v), 5) for k, v in (sims or {}).items()}, separators=(",", ":")))
+    except Exception:
+        pass
     if rotation is None:
         best = ProbeView(max(sims, key=sims.get)) if sims else None
-        logger.info(f"[ORIENT] '{task.stem}' best={best.value if best else '?'} | no rotation")
+        gate = ""
+        if best in _SIDE_YAW:   # [orient_gate] only reachable with PGH_ORIENT_MIN_MARGIN > 0
+            m = _side_margin(sims, best)
+            gate = f" (side gate: m={m if m is None else round(m, 4)} < {_side_min_margin()})"
+        logger.info(f"[ORIENT] '{task.stem}' best={best.value if best else '?'} | no rotation{gate}")
         return OrientationResult(best_view=best, sims=sims, reason="already_front")
 
     steps = [(s.axis.value, s.angle_expr) for s in rotation.steps]

@@ -17,6 +17,17 @@ from utils.http import download_image
 
 from pipeline.batch_stats import STATS
 from llm import burst as _burst
+from modules.js_checker import three_repair as _three_repair   # [pgh16] PGH_THREE_REPAIR (default off)
+from pipeline import orient_final as _orient_final   # [R86] PGH_ORIENT_FINAL (default off)
+from modules.js_checker import mech_repair as _mech_repair   # [R81] PGH_MECH_REPAIR / PGH_CHECK_TIMEOUT_RETRY (default off)
+try:   # [R96 pgh17d] PGH_DEADLINE_SALVAGE / PGH_K_CPU_AWARE (image: 1 / 0; unset = off; import failure = off)
+    import pgh_salvage as _salv
+except Exception:
+    _salv = None
+try:
+    import pgh_kcpu as _kcpu
+except Exception:
+    _kcpu = None
 
 
 class StageError(Exception):
@@ -123,6 +134,14 @@ async def code_and_check(
                     js_errors=list(task.js_errors or []),
                 )
 
+        _sd = __import__("os").environ.get("SAVE_DRAFTS_DIR")   # [patch_loop] edit 8 (opt-in): keep every draft's code
+        if _sd and task.js_code:
+            try:
+                _p = __import__("pathlib").Path(_sd)
+                _p.mkdir(parents=True, exist_ok=True)
+                (_p / f"{task.stem}.it{task.iteration}.a{attempt}.js").write_text(task.js_code)
+            except Exception:
+                pass
         async with stage_guard(task, "js_checker", sem_checker, status):
             task.js_valid = None
             task.js_errors = []
@@ -202,6 +221,371 @@ def _is_live(cand: Candidate | None) -> bool:
     )
 
 
+def _save_semi(stem: str, cand, task) -> None:   # [patch_loop] edit 13
+    import json as _j
+    from pathlib import Path as _P
+    try:
+        d = _P(__import__("os").environ["SAVE_SEMIS_DIR"]) / stem
+        kd = d / f"k{cand.k}"
+        if (kd / "done").exists():
+            return
+        for sub in ("white", "gray"):
+            (kd / sub).mkdir(parents=True, exist_ok=True)
+        if not (d / "photo.bin").exists():
+            (d / "photo.bin").write_bytes(task.image_bytes or b"")
+            (d / "photo.json").write_text(_j.dumps({"mime": task.image_mime}))
+        (kd / "grid.png").write_bytes(cand.rendered_png or b"")
+        for sub, views in (("white", cand.judge_white_views), ("gray", cand.judge_gray_views)):
+            for name, b in (views or {}).items():
+                (kd / sub / f"{name}.png").write_bytes(b)
+        if cand.judge_embeddings:
+            (kd / "emb.bin").write_bytes(cand.judge_embeddings)
+        (kd / "code.js").write_text(cand.js_code or "")
+        (kd / "done").write_text("")
+    except Exception as exc:
+        logger.warning(f"[SAVE_SEMIS] {stem} k{getattr(cand, 'k', '?')}: {exc}")
+
+
+def _save_duel(stem: str, rec: dict) -> None:   # [patch_loop] edit 14
+    try:
+        d = __import__("pathlib").Path(__import__("os").environ["SAVE_SEMIS_DIR"]) / stem
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "duels.jsonl", "a") as f:
+            f.write(__import__("json").dumps(rec, default=str) + "\n")
+    except Exception as exc:
+        logger.warning(f"[SAVE_SEMIS] {stem} duel: {exc}")
+
+
+def _rr_top4_on() -> bool:   # [patch_loop] edit 15
+    return __import__("os").environ.get("ROUND_ROBIN_TOP4", "1").strip() != "0"
+
+
+def _rr_is_draw(decided_by: str) -> bool:
+    return "DINO tie-break" in decided_by or "draw -> A" in decided_by
+
+
+def _rr_pick(top: list, res: dict, bracket_k):
+    """[patch_loop] edit 15: res[(i, j)] = (winner position, draw) for every pair i < j of top. Returns (pick, score)."""
+    score = {k: 0 for k in top}
+    for (i, j), (w, draw) in sorted(res.items()):
+        if not draw:
+            score[w] += 1
+            score[j if w == i else i] -= 1
+    best = max(score.values())
+    tied = sorted(k for k, s in score.items() if s == best)
+    if len(tied) == 1:
+        return tied[0], score
+    if len(tied) == 2 and not res[(tied[0], tied[1])][1]:
+        return res[(tied[0], tied[1])][0], score
+    return (bracket_k if bracket_k in tied else tied[0]), score
+
+
+# [R86] PGH_TIE_NEUTRAL=1 (default off = pgh17, additions only): pgh17's _rr_pick above breaks an RR tie the bracket
+# winner is not in by the LOWEST k = a position (with PGH_MIX_SPLIT 0.5 even k = UtevoLux). The wrapper keeps every
+# other outcome and replaces only that fallback by the best DINO best-view similarity, then a sha256(stem|k) coin.
+_rr_pick_pgh17 = _rr_pick   # [R86]
+_R86_TIE: dict = {}   # [R86] {"sims": {k: s}, "stem": str}, set right before the RR call (no await in between)
+
+
+def _tie_neutral() -> bool:   # [R86]
+    return __import__("os").environ.get("PGH_TIE_NEUTRAL", "").strip().lower() in ("1", "on", "true")
+
+
+def _rr_pick(top: list, res: dict, bracket_k, sims: dict | None = None, stem: str | None = None):   # [R86] wrapper
+    pick, score = _rr_pick_pgh17(top, res, bracket_k)
+    if not _tie_neutral() or not score:
+        return pick, score
+    best = max(score.values())
+    tied = sorted(k for k, s in score.items() if s == best)
+    if len(tied) == 1 or bracket_k in tied or (len(tied) == 2 and not res[(tied[0], tied[1])][1]):
+        return pick, score   # decided by results / the bracket's duel, not by position
+    if sims is None:
+        sims = _R86_TIE.get("sims") or {}
+    return _neutral_tie_pick(tied, sims, stem if stem is not None else _R86_TIE.get("stem", "")), score
+
+
+def _neutral_tie_pick(tied: list, sims: dict, stem: str):   # [R86]
+    """Among tied keys: the highest best-view DINO similarity (the judge's own draw signal); missing/equal -> a
+    sha256 coin over (stem, k). Never depends on the key order."""
+    have = {k: sims.get(k) for k in tied if sims.get(k) is not None}
+    if have:
+        top = max(have.values())
+        best = sorted(k for k, v in have.items() if v == top)
+        if len(best) == 1:
+            return best[0]
+        tied = best
+    return sorted(tied, key=lambda k: hashlib.sha256(f"{stem}|{k}".encode()).hexdigest())[0]
+
+
+async def _round_robin_top4(task, n: int, winner_of, judge_duel):
+    """[patch_loop] edit 15: the leader's bracket over positions [0, n) with the R5/R6 level replaced by the bracket's own
+    semis + final plus the other pairs of the top set; returns the round-robin pick (the bracket winner on any fallback)."""
+    env = __import__("os").environ
+    try:
+        cutoff = float(env.get("ROUND_ROBIN_CUTOFF_S", "2400") or 0)
+    except ValueError:
+        cutoff = 2400.0
+    mid = n // 2   # the leader's _winner_of split: halves [0, mid) [mid, n), quarters split each half again
+    blocks = [(0, mid // 2), (mid // 2, mid), (mid, (mid + n) // 2), ((mid + n) // 2, n)]
+    rnd_half = ((mid - 1).bit_length(), (n - mid - 1).bit_length())
+    rnd_final = (n - 1).bit_length()
+    quarter = [asyncio.ensure_future(winner_of(lo, hi)) for lo, hi in blocks]
+    res: dict = {}
+    errors: dict = {}
+    s1rec: dict = {}   # [R84 jalign] (left k, right k) -> S1 slim detail, for PGH_RR_CUTOFF_FALLBACK
+
+    async def duel(a, b, rnd, extra):
+        out = {"label": f"RR k{a.k}-vs-k{b.k}"} if extra else {}
+        w = await judge_duel(a, b, rnd, out)
+        res[(a.k, b.k)] = (w.k, _rr_is_draw(out.get("decided_by", "")))
+        s1rec[(a.k, b.k)] = out.get("s1")
+        return w
+
+    async def half(h):   # = the leader's _winner_of(half): walkover rules, then the semi
+        a, b = await asyncio.gather(quarter[2 * h], quarter[2 * h + 1])
+        if not _is_live(a):
+            return b
+        if not _is_live(b):
+            return a
+        return await duel(a, b, rnd_half[h], False)
+
+    halves = [asyncio.ensure_future(half(0)), asyncio.ensure_future(half(1))]
+
+    async def cross(qa, qb):   # an RR-only pair: starts once it is known not to be the bracket's final
+        a, b = await asyncio.shield(quarter[qa]), await asyncio.shield(quarter[qb])
+        if not (_is_live(a) and _is_live(b)):
+            return
+        own = {halves[0]: a, halves[1]: b}
+        rest = set(own)
+        while rest:
+            done, rest = await asyncio.wait(rest, return_when=asyncio.FIRST_COMPLETED)
+            if any(t.result() is not own[t] for t in done):
+                break
+        else:
+            return   # both won their half: the bracket's final, played below
+        try:
+            await duel(a, b, rnd_final, True)
+        except Exception as exc:   # an RR-only duel never fails the prompt: the bracket winner is kept
+            errors[(a.k, b.k)] = f"{type(exc).__name__}: {exc}"[:200]
+
+    extras = [asyncio.ensure_future(cross(qa, qb)) for qa in (0, 1) for qb in (2, 3)]
+    why = None
+    try:   # the bracket exactly as the leader resolves its last level (errors here propagate as in the leader)
+        left, right = await asyncio.gather(*halves)
+        if not _is_live(left):
+            bracket = right
+        elif not _is_live(right):
+            bracket = left
+        else:
+            bracket = await duel(left, right, rnd_final, False)
+        t_b = time.monotonic()
+        top = [q.result() for q in quarter if _is_live(q.result())]
+        if len(top) >= 3:
+            remaining = None if cutoff <= 0 else (task.started_at or time.time()) + cutoff - time.time()
+            done, pending = await asyncio.wait(extras, timeout=None if remaining is None else max(0.0, remaining))
+            if pending:
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                why = f"cutoff {cutoff:.0f}s ({len(pending)} RR duels cancelled)"
+            for t in done:
+                if not t.cancelled() and t.exception() is not None:
+                    errors[("?", id(t))] = f"{type(t.exception()).__name__}: {t.exception()}"[:200]
+    finally:   # never leave an RR duel running (cancellation, a bracket error, or < 3 players = no RR pair at all)
+        for t in extras:
+            if not t.done():
+                t.cancel()
+            elif not t.cancelled():
+                t.exception()   # retrieved (no "never retrieved" noise after a bracket error)
+    keys = [c.k for c in top]
+    pairs = [(i, j) for x, i in enumerate(keys) for j in keys[x + 1:]]
+    if errors:
+        why = "duel error " + "; ".join(f"{p}: {e}" for p, e in sorted(errors.items(), key=str))
+    elif why is None and len(top) >= 3 and any(p not in res for p in pairs):
+        why = f"missing {[p for p in pairs if p not in res]}"
+    if len(top) < 3 or why is not None or not _is_live(bracket):
+        pick, score = bracket, {}
+        pick = _cutoff_fallback(task, top, s1rec, bracket, why, pick)   # [R84 jalign] off: returns pick unchanged
+    else:
+        if _tie_neutral():   # [R86] DINO sims for a neutral multi-way tie (off: never computed); no await until the call
+            try:
+                from pipeline.orient_final import _bvs
+                _R86_TIE.update(sims={c.k: _bvs(c.judge_embeddings) for c in top}, stem=task.stem)
+            except Exception:
+                _R86_TIE.update(sims={}, stem=task.stem)
+        pk, score = _rr_pick(keys, res, bracket.k)
+        pick = next(c for c in top if c.k == pk)
+    wins = {k: sum(1 for (w, d) in res.values() if w == k and not d) for k in keys}
+    logger.info(
+        f"[ROUND_ROBIN] {task.stem} top={keys} wins={wins} score={score} draws={sum(d for _, d in res.values())} "
+        f"pick=k{getattr(pick, 'k', None)} bracket=k{getattr(bracket, 'k', None)} "
+        f"changed={'yes' if pick is not bracket else 'no'} duels={len(res) + len(errors)} "
+        f"rr_only={max(0, len(res) + len(errors) - (len(top) - 1))} wait_after_bracket={time.monotonic() - t_b:.1f}s"
+        + (f" FALLBACK={why}" if why else "")
+    )
+    return pick
+
+
+def _cutoff_fallback(task, top: list, s1rec: dict, bracket, why, pick):   # [R84 jalign] PGH_RR_CUTOFF_FALLBACK
+    """Only when the RR cutoff fired (why starts with "cutoff"), the bracket is live, >= 3 players and the switch is
+    "s1pen": the top-set player with the lowest mean S1 penalty over its finished top-set duels. Else `pick`."""
+    if not (why and str(why).startswith("cutoff") and len(top) >= 3 and _is_live(bracket)):
+        return pick
+    if not __import__("os").environ.get("PGH_RR_CUTOFF_FALLBACK"):
+        return pick
+    import pgh_jalign as _ja
+    if _ja.cutoff_fallback() != "s1pen":
+        return pick
+    try:
+        pk, means = _ja.s1pen_pick_key([c.k for c in top], s1rec, bracket.k)
+        new = next(c for c in top if c.k == pk)
+    except Exception as exc:   # never fail the prompt over the fallback
+        logger.warning(f"[RR_CUTOFF_FALLBACK] {task.stem} error {type(exc).__name__}: {exc} -> bracket")
+        return pick
+    logger.info(
+        f"[RR_CUTOFF_FALLBACK] {task.stem} mode=s1pen pick=k{new.k} bracket=k{bracket.k} "
+        f"changed={'yes' if new is not bracket else 'no'} means={ {k: round(v, 3) for k, v in sorted(means.items())} } "
+        f"why={why}"
+    )
+    return new
+
+
+async def _round_robin_top8(task, n: int, winner_of, judge_duel):
+    """[R84 jalign] PGH_RR8: the same bracket as _round_robin_top4 / winner_of over positions [0, n) (same splits,
+    rounds, seats and walkovers; the bracket winner is unchanged), but the round robin covers the 8 eighth-block
+    winners: every pair the bracket does not play is an extra duel ("RR8 k<a>-vs-k<b>", left = lower block, round =
+    the final's, so no S1 early stop), started as soon as it is known not to be a bracket duel. Pick = _rr_pick over
+    all pairs among the live eighth winners (up to 28). Any extra-duel error, a missing pair or the cutoff -> the
+    bracket winner (or PGH_RR_CUTOFF_FALLBACK on a cutoff), exactly as top-4."""
+    env = __import__("os").environ
+    try:
+        cutoff = float(env.get("ROUND_ROBIN_CUTOFF_S", "2400") or 0)
+    except ValueError:
+        cutoff = 2400.0
+    mid = n // 2
+    qblocks = [(0, mid // 2), (mid // 2, mid), (mid, (mid + n) // 2), ((mid + n) // 2, n)]
+    eblocks = []
+    for lo, hi in qblocks:   # winner_of's own split of each quarter
+        m = (lo + hi) // 2
+        eblocks += [(lo, m), (m, hi)]
+    rnd_q = [(hi - lo - 1).bit_length() for lo, hi in qblocks]
+    rnd_half = ((mid - 1).bit_length(), (n - mid - 1).bit_length())
+    rnd_final = (n - 1).bit_length()
+    eighth = [asyncio.ensure_future(winner_of(lo, hi)) for lo, hi in eblocks]
+    res: dict = {}
+    errors: dict = {}
+    s1rec: dict = {}
+
+    async def duel(a, b, rnd, extra):
+        out = {"label": f"RR8 k{a.k}-vs-k{b.k}"} if extra else {}
+        w = await judge_duel(a, b, rnd, out)
+        res[(a.k, b.k)] = (w.k, _rr_is_draw(out.get("decided_by", "")))
+        s1rec[(a.k, b.k)] = out.get("s1")
+        return w
+
+    async def quarter(q):   # = winner_of(qblocks[q]): walkover rules, then the quarter duel
+        a, b = await asyncio.gather(eighth[2 * q], eighth[2 * q + 1])
+        if not _is_live(a):
+            return b
+        if not _is_live(b):
+            return a
+        return await duel(a, b, rnd_q[q], False)
+
+    quarters = [asyncio.ensure_future(quarter(q)) for q in range(4)]
+
+    async def half(h):
+        a, b = await asyncio.gather(quarters[2 * h], quarters[2 * h + 1])
+        if not _is_live(a):
+            return b
+        if not _is_live(b):
+            return a
+        return await duel(a, b, rnd_half[h], False)
+
+    halves = [asyncio.ensure_future(half(0)), asyncio.ensure_future(half(1))]
+
+    async def cross(i, j):   # eighth winners i < j from different quarters: an extra pair unless the bracket plays it
+        a, b = await asyncio.shield(eighth[i]), await asyncio.shield(eighth[j])
+        if not (_is_live(a) and _is_live(b)):
+            return
+        if i // 4 == j // 4:   # same half: the bracket plays it as that half's semi iff both win their quarter
+            own = {quarters[i // 2]: a, quarters[j // 2]: b}
+        else:   # different halves: the bracket's final iff both win their quarter and their half
+            own = {quarters[i // 2]: a, halves[i // 4]: a, quarters[j // 2]: b, halves[j // 4]: b}
+        rest = set(own)
+        while rest:
+            done, rest = await asyncio.wait(rest, return_when=asyncio.FIRST_COMPLETED)
+            if any(t.result() is not own[t] for t in done):
+                break
+        else:
+            return
+        rr_only.add((a.k, b.k))
+        try:
+            await duel(a, b, rnd_final, True)
+        except Exception as exc:   # an RR-only duel never fails the prompt: the bracket winner is kept
+            errors[(a.k, b.k)] = f"{type(exc).__name__}: {exc}"[:200]
+
+    rr_only: set = set()
+    extras = [asyncio.ensure_future(cross(i, j)) for i in range(8) for j in range(i + 1, 8) if i // 2 != j // 2]
+    why = None
+    top: list = []
+    t_b = time.monotonic()
+    try:
+        left, right = await asyncio.gather(*halves)
+        if not _is_live(left):
+            bracket = right
+        elif not _is_live(right):
+            bracket = left
+        else:
+            bracket = await duel(left, right, rnd_final, False)
+        t_b = time.monotonic()
+        top = [e.result() for e in eighth if _is_live(e.result())]
+        if len(top) >= 3:
+            remaining = None if cutoff <= 0 else (task.started_at or time.time()) + cutoff - time.time()
+            done, pending = await asyncio.wait(extras, timeout=None if remaining is None else max(0.0, remaining))
+            if pending:
+                for t in pending:
+                    t.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+                why = f"cutoff {cutoff:.0f}s ({len(pending)} RR duels cancelled)"
+            for t in done:
+                if not t.cancelled() and t.exception() is not None:
+                    errors[("?", id(t))] = f"{type(t.exception()).__name__}: {t.exception()}"[:200]
+    finally:
+        for t in extras:
+            if not t.done():
+                t.cancel()
+            elif not t.cancelled():
+                t.exception()
+    keys = [c.k for c in top]
+    pairs = [(i, j) for x, i in enumerate(keys) for j in keys[x + 1:]]
+    if errors:
+        why = "duel error " + "; ".join(f"{p}: {e}" for p, e in sorted(errors.items(), key=str))
+    elif why is None and len(top) >= 3 and any(p not in res for p in pairs):
+        why = f"missing {[p for p in pairs if p not in res]}"
+    if len(top) < 3 or why is not None or not _is_live(bracket):
+        pick, score = bracket, {}
+        pick = _cutoff_fallback(task, top, s1rec, bracket, why, pick)
+    else:
+        if _tie_neutral():   # [R87 pgh17c] R86's DINO sims for RR8 too (else a tie would read the last top-4 photo's sims)
+            try:
+                from pipeline.orient_final import _bvs
+                _R86_TIE.update(sims={c.k: _bvs(c.judge_embeddings) for c in top}, stem=task.stem)
+            except Exception:
+                _R86_TIE.update(sims={}, stem=task.stem)
+        pk, score = _rr_pick(keys, res, bracket.k)
+        pick = next(c for c in top if c.k == pk)
+    wins = {k: sum(1 for (w, d) in res.values() if w == k and not d and k in keys) for k in keys}
+    logger.info(
+        f"[ROUND_ROBIN] {task.stem} RR8 top={keys} wins={wins} score={score} draws={sum(d for _, d in res.values())} "
+        f"pick=k{getattr(pick, 'k', None)} bracket=k{getattr(bracket, 'k', None)} "
+        f"changed={'yes' if pick is not bracket else 'no'} duels={len(res) + len(errors)} "
+        f"rr_only={sum(1 for p in res if p in rr_only)} "
+        f"wait_after_bracket={time.monotonic() - t_b:.1f}s"
+        + (f" FALLBACK={why}" if why else "")
+    )
+    return pick
+
+
 async def _resolve_bracket(
     *,
     task: PipelineTask,
@@ -218,9 +602,12 @@ async def _resolve_bracket(
     drop, so the outcome is reproducible under a fixed seed.
     """
 
-    async def _judge_duel(left: Candidate, right: Candidate, round_no: int) -> Candidate:
+    async def _judge_duel(left: Candidate, right: Candidate, round_no: int, _rr: dict | None = None) -> Candidate:
         """Compare two live candidates head-to-head and return the winner."""
-        label = f"R{round_no} k{left.k}-vs-k{right.k}"
+        label = (_rr or {}).get("label") or f"R{round_no} k{left.k}-vs-k{right.k}"   # [patch_loop] edit 15: "RR ..." extras
+        if __import__("os").environ.get("SAVE_SEMIS_DIR") and round_no >= int(__import__("os").environ.get("SAVE_SEMIS_MIN_ROUND") or 4):   # [patch_loop] edit 13: fire and forget (top 8; MIN_ROUND=1: every duel player)
+            for _c in (left, right):
+                asyncio.get_running_loop().run_in_executor(None, _save_semi, task.stem, _c, task)
         _t_q = time.monotonic()
         async with sem_judge:
             _t_s = time.monotonic()
@@ -240,6 +627,15 @@ async def _resolve_bracket(
                 early_stop=judge.early_stop_for_round(round_no),
             )
         winner = left if verdict.winner == "A" else right
+        if _salv is not None and _salv.ON:   # [R96 pgh17d] the bracket leader so far
+            _salv.note_duel(task, round_no, winner, right if winner is left else left)
+        if _rr is not None:   # [patch_loop] edit 15: the round robin needs the verdict's draw marker
+            _rr["decided_by"] = str(getattr(verdict, "decided_by", "") or "")
+            _rr["s1"] = (getattr(verdict, "detail", None) or {}).get("s1_slim")   # [R84 jalign] cutoff fallback input
+        if __import__("os").environ.get("SAVE_SEMIS_DIR"):   # [patch_loop] edit 14: per-duel S1 detail, fire and forget
+            asyncio.get_running_loop().run_in_executor(None, _save_duel, task.stem, {
+                "label": label, "l": left.k, "r": right.k, "w": winner.k, "decided_by": str(getattr(verdict, "decided_by", "")),
+                "rnd": round_no, **{k: (getattr(verdict, "detail", None) or {}).get(f"{k}_slim") for k in ("s1", "s2", "s3")}})
         _t_e = time.monotonic()
         STATS.duel(_t_e - _t_s, _t_s - _t_q)
         logger.info(
@@ -267,6 +663,17 @@ async def _resolve_bracket(
 
     if not leaf_tasks:
         return None
+    if __import__("os").environ.get("PGH_SHADOW"):   # [opt_r5 shadow] default off: record the verdicts, change nothing
+        import pgh_shadow as _shadow
+        _sh_rec = _shadow.recorder(task, judge, leaf_tasks) if _shadow.on() else None
+        if _sh_rec is not None:
+            _judge_duel = _sh_rec.wrap(_judge_duel)
+    if _rr_top4_on() and len(leaf_tasks) >= 4:   # [patch_loop] edit 15: top-4 round robin on the bracket's last 4
+        if __import__("os").environ.get("PGH_RR8") and len(leaf_tasks) >= 8:   # [R84 jalign] top-8 RR, default off
+            import pgh_jalign as _ja
+            if _ja.rr8_for(task.stem, len(leaf_tasks)):
+                return await _round_robin_top8(task, len(leaf_tasks), _winner_of, _judge_duel)
+        return await _round_robin_top4(task, len(leaf_tasks), _winner_of, _judge_duel)
     return await _winner_of(0, len(leaf_tasks))
 
 
@@ -356,6 +763,14 @@ class _CandidateFactory:
         }
         return self._coder_tasks
 
+    def add_coders(self, k_from: int, k_to: int) -> None:   # [R82 kbudget] top-up drafts k_from..k_to-1 (same seeds as fixed)
+        if k_to <= k_from:
+            return
+        if _burst.CTRL:
+            _burst.CTRL.coder_begin(k_to - k_from, self.task.stem)
+        for k in range(k_from, k_to):
+            self._coder_tasks[k] = asyncio.create_task(self._generate(k))
+
     async def embed_reference(self) -> None:
         """Embed the reference image once, shared by every candidate's S2BV npz.
 
@@ -412,6 +827,8 @@ class _CandidateFactory:
         try:
             async with asyncio.timeout(remaining):
                 async with stage_guard(task, f"coder#k{k}", self.sem_coder, self.status):
+                    if _kcpu is not None and _kcpu.ON and _kcpu.KCPU.brake(self, k, log=logger.info):   # [R96 pgh17d]
+                        raise _kcpu.Braked("render backlog brake")
                     if _burst.CTRL:
                         await _burst.CTRL.ensure_coder()
                     cand.js_code = await self.coder.code(
@@ -436,10 +853,21 @@ class _CandidateFactory:
         cand.elapsed_s = time.time() - t0
         return cand
 
+    async def _try_three_repair(self, cand: Candidate, shadow: PipelineTask) -> PipelineTask:   # [pgh16]
+        return await _try_three_repair_impl(self, cand, shadow)
+
     async def _validate(self, cand: Candidate) -> None:
         if cand.drop_reason is not None or cand.js_code is None:
             return
         task = self.task
+        _sd = __import__("os").environ.get("SAVE_DRAFTS_DIR")   # [patch_loop] edit 8 (ensemble path): every raw draft
+        if _sd:
+            try:
+                _p = __import__("pathlib").Path(_sd)
+                _p.mkdir(parents=True, exist_ok=True)
+                (_p / f"{task.stem}.k{cand.k}.js").write_text(cand.js_code)
+            except Exception:
+                pass
         shadow = PipelineTask(stem=f"{task.stem}#k{cand.k}", image_url=task.image_url)
         shadow.js_code = cand.js_code
         shadow.image_bytes = task.image_bytes
@@ -452,12 +880,23 @@ class _CandidateFactory:
                 cand.drop_reason = f"checker:{type(exc).__name__}"
                 cand.elapsed_s += time.time() - t0
                 return
+        if not shadow.js_valid and _mech_repair.timeout_retry_enabled() and _mech_repair.timeout_only(shadow.js_errors):   # [R81]
+            shadow = await _recheck_timeout_impl(self, cand, shadow)
+        if not shadow.js_valid and _mech_repair.repair_enabled():   # [R81] opt-in; off = this line does nothing
+            shadow = await _try_mech_repair_impl(self, cand, shadow)
+        if not shadow.js_valid and _three_repair.repair_enabled():   # [pgh16] opt-in; off = this line does nothing
+            shadow = await self._try_three_repair(cand, shadow)
         cand.js_valid = shadow.js_valid
         cand.js_errors = list(shadow.js_errors or [])
         cand.scene_json = shadow.scene_json
         if not shadow.js_valid:
             cand.drop_reason = "checker"
             cand.elapsed_s += time.time() - t0
+            return
+        if _render_late(self):   # [patch_loop] edit 11 (opt-in): walkover instead of a late render
+            cand.drop_reason = "render:deadline"
+            cand.elapsed_s += time.time() - t0
+            logger.warning(f"[RENDER DEADLINE] {task.stem} k{cand.k} dropped before the probe")
             return
         if self.orientation.enabled:
             result = await orient_task(
@@ -477,7 +916,16 @@ class _CandidateFactory:
         )
         white: dict = {}
         gray: dict = {}
-        async with self.sem_renderer:
+        # [patch_loop] edit 10: a speculative final kept by the probe (SPEC_FINAL=1, no rotation) needs no render slot
+        _spec_ok = (judge_views_wanted and getattr(self.renderer, "spec_ready", None) is not None
+                    and self.renderer.spec_ready(shadow))
+        async with (__import__("contextlib").nullcontext() if _spec_ok else self.sem_renderer):
+            if not _spec_ok and _render_late(self):   # [patch_loop] edit 11 (opt-in), checked once the slot is ours
+                cand.drop_reason = "render:deadline"
+                cand.elapsed_s += time.time() - t0
+                logger.warning(f"[RENDER DEADLINE] {task.stem} k{cand.k} dropped before the final render")
+                return
+            self.__dict__["_finals_admitted"] = self.__dict__.get("_finals_admitted", 0) + 1
             try:
                 if judge_views_wanted:
                     white, gray = await self.renderer.process_with_judge_views(shadow)
@@ -499,6 +947,102 @@ class _CandidateFactory:
                 cand.judge_embeddings = await self.embedder.build_candidate_npz(
                     self.ref_vec, cand.judge_white_views
                 )
+
+
+async def _try_three_repair_impl(factory, cand: Candidate, shadow: PipelineTask) -> PipelineTask:
+    """[pgh16] PGH_THREE_REPAIR=1: a draft rejected ONLY for non-existent THREE constants gets them mapped to allowed
+    ones (modules/js_checker/three_repair.py) and is checked ONCE more by the same checker in the same mode. Returns the
+    new, passing shadow task (cand.js_code is replaced) or the original failed shadow (cand unchanged)."""
+    task = factory.task
+    names = _three_repair.plan(shadow.js_errors)
+    if not names:
+        return shadow
+    fixed, notes = _three_repair.rewrite(cand.js_code, names)
+    if fixed is None:
+        logger.info(f"[THREE_REPAIR] {task.stem} k{cand.k} SKIP {notes[0]}")
+        return shadow
+    retry = PipelineTask(stem=shadow.stem, image_url=task.image_url)
+    retry.js_code = fixed
+    retry.image_bytes = task.image_bytes
+    retry.image_mime = task.image_mime
+    try:
+        async with factory.sem_checker:
+            await factory.js_checker.process(retry, mode=factory.checker_mode)
+    except Exception as exc:
+        logger.warning(f"[THREE_REPAIR] {task.stem} k{cand.k} recheck error {type(exc).__name__}")
+        return shadow
+    if not retry.js_valid:
+        logger.info(f"[THREE_REPAIR] {task.stem} k{cand.k} FAILED_RECHECK {', '.join(notes)} | {(retry.js_errors or ['?'])[0][:120]}")
+        return shadow
+    logger.info(f"[THREE_REPAIR] {task.stem} k{cand.k} REPAIRED {', '.join(notes)}")
+    cand.js_code = fixed
+    task.meta.setdefault("three_repair", {})[cand.k] = notes
+    return retry
+
+
+async def _recheck_once_impl(factory, cand: Candidate, shadow: PipelineTask, code: str, tag: str):
+    """[R81] one more run of the SAME checker (same mode, same semaphore) on `code`; returns the new task or None on error."""
+    task = factory.task
+    retry = PipelineTask(stem=shadow.stem, image_url=task.image_url)
+    retry.js_code = code
+    retry.image_bytes = task.image_bytes
+    retry.image_mime = task.image_mime
+    try:
+        async with factory.sem_checker:
+            await factory.js_checker.process(retry, mode=factory.checker_mode)
+    except Exception as exc:
+        logger.warning(f"[{tag}] {task.stem} k{cand.k} recheck error {type(exc).__name__}")
+        return None
+    return retry
+
+
+async def _recheck_timeout_impl(factory, cand: Candidate, shadow: PipelineTask) -> PipelineTask:
+    """[R81] PGH_CHECK_TIMEOUT_RETRY=1: a draft whose ONLY failures are TIMEOUT_EXCEEDED (CPU contention) is checked once
+    more, unchanged. Returns the passing re-check or the original failed shadow."""
+    retry = await _recheck_once_impl(factory, cand, shadow, cand.js_code, "TIMEOUT_RETRY")
+    ok = retry is not None and retry.js_valid
+    logger.info(f"[TIMEOUT_RETRY] {factory.task.stem} k{cand.k} {'PASS' if ok else 'FAIL'}")
+    if not ok:
+        return shadow
+    factory.task.meta.setdefault("timeout_retry", {})[cand.k] = True
+    return retry
+
+
+async def _try_mech_repair_impl(factory, cand: Candidate, shadow: PipelineTask) -> PipelineTask:
+    """[R81] PGH_MECH_REPAIR=1: a draft rejected for ONE repairable error class (modules/js_checker/mech_repair.py:
+    duplicate declaration, extra ')', undeclared names, const reassignment, NaN bounds, texture > 4 MiB) is rewritten and
+    checked ONCE more by the same checker in the same mode. Returns the new, passing shadow task (cand.js_code is
+    replaced) or the original failed shadow (cand unchanged)."""
+    task = factory.task
+    fixed, notes = await asyncio.to_thread(_mech_repair.repair, cand.js_code, shadow.js_errors)   # off the event loop
+    if fixed is None:
+        if notes and notes[0] != "skip:class":
+            logger.info(f"[MECH_REPAIR] {task.stem} k{cand.k} SKIP {notes[0]}")
+        return shadow
+    retry = await _recheck_once_impl(factory, cand, shadow, fixed, "MECH_REPAIR")
+    if retry is None:
+        return shadow
+    if not retry.js_valid:
+        logger.info(f"[MECH_REPAIR] {task.stem} k{cand.k} FAILED_RECHECK {', '.join(notes)} | {(retry.js_errors or ['?'])[0][:120]}")
+        return shadow
+    logger.info(f"[MECH_REPAIR] {task.stem} k{cand.k} REPAIRED {', '.join(notes)}")
+    cand.js_code = fixed
+    task.meta.setdefault("mech_repair", {})[cand.k] = notes
+    return retry
+
+
+def _render_late(factory) -> bool:
+    """[patch_loop] edit 11: past RENDER_DEADLINE_S (from the prompt's start) and the prompt already has
+    RENDER_DEADLINE_MIN_LIVE finals admitted. Env unset/0 = never (the leader's behaviour)."""
+    env = __import__("os").environ
+    try:
+        limit = float(env.get("RENDER_DEADLINE_S", "0") or 0)
+        min_live = int(env.get("RENDER_DEADLINE_MIN_LIVE", "20") or 20)
+    except ValueError:
+        return False
+    if limit <= 0 or time.time() < (factory.task.started_at or time.time()) + limit:
+        return False
+    return factory.__dict__.get("_finals_admitted", 0) >= min_live
 
 
 async def multigen_first_iter(
@@ -533,6 +1077,20 @@ async def multigen_first_iter(
     osd = OSD.model_validate_json(task.osd) if task.osd is not None else None
     send_image = (osd is None) or coder_multimodal
     K = ensemble_size
+    # [pgh1v3] PGH_TIMEGUARD (pgh_timeguard.py): this batch's K from the batch-boundary round guard; the pool stays the
+    # prefix range(K). Switch off, shadow mode or any failure = K unchanged = pgh1v2.
+    if __import__("os").environ.get("PGH_TIMEGUARD", "0").strip().lower() not in ("", "0", "off"):
+        try:
+            import pgh_timeguard as _tg
+            if _tg.enabled():
+                K = max(1, min(K, int(_tg.k_cap(K, task=task))))
+        except Exception as exc:  # never block a prompt
+            logger.warning(f"[TIMEGUARD] hook failed, K={K} kept: {exc!r}")
+    if _kcpu is not None and _kcpu.ON:   # [R96 pgh17d] PGH_K_CPU_AWARE prior: this batch's CPU-quota K cap
+        try:
+            K = _kcpu.KCPU.cap_k(K)
+        except Exception as exc:  # never block a prompt
+            logger.warning(f"[KCPU] hook failed, K={K} kept: {exc!r}")
 
     logger.info(
         f"[MULTIGEN] {task.stem} K={K} | temperature={ensemble_temperature} | "
@@ -558,12 +1116,54 @@ async def multigen_first_iter(
         orientation=orientation,
         candidate_deadline_s=candidate_deadline_s,
     )
+    if _salv is not None and _salv.ON:   # [R96 pgh17d] the deadline branch reads this prompt's drafts from the factory
+        _salv.register(task, factory)
+    if _kcpu is not None and _kcpu.ON:   # [R96 pgh17d] semaphore sizes for the brake
+        _kcpu.KCPU.plan(factory)
+
+    _kb, _kb_plan = None, None   # [R82 kbudget] PGH_K_MODE=budget: equal coder tokens per photo (budget_k.py); else = pgh16
+    if __import__("os").environ.get("PGH_K_MODE", "").strip().lower() == "budget":
+        try:
+            from modules.metrics import budget_k as _kb
+            _kb_plan = _kb.ALLOC.plan(K)
+        except Exception as exc:  # never block a prompt
+            logger.warning(f"[KBUDGET] plan failed, K={K} kept: {exc!r}")
+            _kb, _kb_plan = None, None
+    _kb_on, _kb_K, _kb_hold = bool(_kb_plan and _kb_plan.get("active")), K, None
+    if _kb_on:
+        K = _kb_plan["k_start"]   # first wave = K_lo drafts; the top-up below sets K = K_i before any leaf/bracket exists
 
     # Launch every coder at once, then embed the reference while they run; each
     # candidate then flows coder -> dedup -> render -> bracket on its own, with no
     # barrier, so rendering and judging overlap the slower coders still in flight.
     coder_tasks = factory.start_coders(K)
+    if _kb_on and _burst.CTRL:   # [R82 kbudget] placeholder: the burst controller never sees 0 pending before the top-up
+        _kb_hold = _burst.CTRL.coder_begin(1, task.stem)
     await factory.embed_reference()
+
+    if _kb_on:   # [R82 kbudget] drafts k < n0 back (seed order = unbiased sample) -> K_i, launch k = K_lo..K_i-1
+        K_i = K
+        try:
+            firsts = await asyncio.gather(*(coder_tasks[k] for k in range(_kb_plan["n0"])))
+            rem = None
+            if factory.candidate_deadline_at is not None and candidate_deadline_s > 0:
+                rem = max(0.0, factory.candidate_deadline_at - time.time()) / candidate_deadline_s
+            dec = _kb.ALLOC.decide(_kb_K, [len(c.js_code.encode("utf-8")) for c in firsts if c.js_code],
+                                   stem=task.stem, remaining_frac=rem)
+            K_i = max(K, int(dec["k"]))
+            task.meta["kbudget"] = dec
+            logger.info(f"[KBUDGET] {task.stem} K={_kb_K} -> K_i={K_i} | {dec}")
+        except Exception as exc:  # never block a prompt: fall back to the batch K
+            logger.warning(f"[KBUDGET] decide failed, K_i={_kb_K}: {exc!r}")
+            K_i = max(K, _kb_K)
+        except BaseException:      # cancelled (task deadline / batch timeout): no top-up, release the placeholder
+            if _kb_hold is not None:
+                _burst.CTRL.coder_end(_kb_hold)
+            raise
+        factory.add_coders(K, K_i)
+        if _kb_hold is not None:
+            _burst.CTRL.coder_end(_kb_hold)
+        K = K_i
 
     leaf_tasks: dict[int, asyncio.Task] = {
         k: asyncio.create_task(factory.leaf(k)) for k in range(K)
@@ -580,6 +1180,11 @@ async def multigen_first_iter(
     # Every leaf (hence every coder) has resolved by the time the bracket returns.
     candidates = [coder_tasks[k].result() for k in range(K)]
     task.candidates = list(candidates)
+    if _kb is not None:   # [R82 kbudget] this photo's mean draft bytes join the reference at batch end
+        try:
+            _kb.ALLOC.observe(task.stem, [len(c.js_code.encode("utf-8")) for c in candidates if c.js_code])
+        except Exception as exc:
+            logger.warning(f"[KBUDGET] observe failed: {exc!r}")
 
     if not _is_live(winner):
         drops = [c.drop_reason for c in candidates]
@@ -587,6 +1192,9 @@ async def multigen_first_iter(
             f"[MULTIGEN] {task.stem} K={K} | drops={drops} | ALL CANDIDATES FAILED"
         )
         raise StageError("multigen", RuntimeError("all candidates failed"))
+
+    if _orient_final.enabled():   # [R86] PGH_ORIENT_FINAL=1: y180 / X +-90 copies of the final, margin gate + judge duel
+        await _orient_final.maybe_turn_final(factory, winner, judge=judge, sem_judge=sem_judge)
 
     survivors = [c for c in candidates if _is_live(c)]
     unique = len({d for d in (_code_digest(c.js_code) for c in candidates) if d})
@@ -602,3 +1210,7 @@ async def multigen_first_iter(
         f"[MULTIGEN] {task.stem} winner=k{winner.k} | "
         f"js_bytes={len(winner.js_code.encode('utf-8')) if winner.js_code else 0}"
     )
+    if __import__("os").environ.get("PGH_SHADOW"):   # [opt_r5 shadow] default off: alt picks in the background, after the pick
+        import pgh_shadow as _shadow
+        if _shadow.on():
+            _shadow.launch(task, factory, winner, judge=judge, sem_judge=sem_judge, K=K)

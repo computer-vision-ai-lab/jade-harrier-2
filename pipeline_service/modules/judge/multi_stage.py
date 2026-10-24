@@ -272,6 +272,10 @@ class IssuesSummary(BaseModel):
     issues: str
 
 
+_STOP_ISSUES = __import__("os").environ.get("JUDGE_STOP_ISSUES", "0") == "1"   # [patch_loop] edit 7 (opt-in)
+_STOP_ISSUES_RE = re.compile(r'^\s*\{\s*"penalty_1"\s*:\s*(-?\d+)\s*,\s*"penalty_2"\s*:\s*(-?\d+)\s*,?\s*$')
+
+
 def _neutral_penalty() -> PenaltyResponse:
     return PenaltyResponse(penalty_1=5, penalty_2=5, issues=JSON_FAILED_MARKER)
 
@@ -453,6 +457,28 @@ def _s2cl_build_verify_user_prompt(checklist: PromptChecklist) -> str:
         f'{{"checks": [{checks_hint}], "main_object_correct": true | false}}'
     )
 
+_INFLIGHT = [0]   # [patch_loop] edit 12: judge chat calls in flight (this process)
+
+
+def _s2_ac_matters(bv_vote, bv_diff, cl_vote, cl_gap) -> bool:
+    """[patch_loop] edit 12: can the artifact-compare vote still change the S2 choice? (mirrors _s2_strong_voter_choice
+    + _s2_consensus as used in evaluate_duel)"""
+    if _s2_strong_voter_choice(bv_diff, cl_gap)[0] is not None:
+        return False
+    return len({_s2_consensus([bv_vote, v, cl_vote], S2_MIN_CONSENSUS)[0] for v in ("A", "B", None)}) > 1
+
+
+def _lazy_ac_on() -> bool:
+    env = __import__("os").environ
+    if env.get("JUDGE_LAZY_AC", "1") == "0":
+        return False
+    try:
+        idle = int(env.get("JUDGE_LAZY_AC_IDLE", "24"))
+    except ValueError:
+        idle = 24
+    return _INFLIGHT[0] >= idle
+
+
 async def _safe_chat_json(
     client: AsyncOpenAI,
     messages: list[dict],
@@ -476,7 +502,10 @@ async def _safe_chat_json(
     }
     for attempt in range(max_retries):
         temp = temperature if attempt == 0 else 0.1 + 0.05 * attempt
+        if attempt > 0 and (_rb := _S2CL_RETRIED.get()) is not None:   # [patch_loop] memo: not a first-attempt result
+            _rb["retried"] = True
         attempt_seed = seed + attempt + 100
+        _INFLIGHT[0] += 1   # [patch_loop] edit 12: judge load signal for the lazy artifact compare
         try:
             completion = await client.chat.completions.create(
                 model=model,
@@ -485,9 +514,14 @@ async def _safe_chat_json(
                 max_tokens=max_tokens,
                 response_format=response_format,
                 seed=attempt_seed,
+                **({"stop": ['"issues"']} if (_STOP_ISSUES and response_model is PenaltyResponse) else {}),
             )
             text = completion.choices[0].message.content or ""
             parsed = _parse_or_repair(text, response_model)
+            if parsed is None and _STOP_ISSUES and response_model is PenaltyResponse:   # [patch_loop] edit 7
+                _m = _STOP_ISSUES_RE.match(text)
+                if _m:
+                    parsed = PenaltyResponse(penalty_1=int(_m.group(1)), penalty_2=int(_m.group(2)), issues="")
             if parsed is not None:
                 if attempt > 0:
                     logger.info(f"{label}: JSON parsed on attempt {attempt + 1}/{max_retries}")
@@ -497,6 +531,8 @@ async def _safe_chat_json(
             last_err = exc
         except Exception as exc:
             last_err = exc
+        finally:
+            _INFLIGHT[0] -= 1
 
         logger.warning(
             f"{label}: attempt {attempt + 1}/{max_retries} failed: "
@@ -974,6 +1010,56 @@ async def _s2cl_verify(
     return cast(VerificationResult, r)
 
 
+_S2CL_MEMO: dict = {}   # [patch_loop] identical-request memo for the photo-only checklist + per-grid verify
+_S2CL_RETRIED = __import__("contextvars").ContextVar("_S2CL_RETRIED", default=None)   # set by _safe_chat_json
+
+
+async def _s2cl_memo(key, make):
+    """Only a first-attempt (temp 0, seed+100) result is shared: if the call needed a retry (re-sampled at temp > 0)
+    or failed, it is not cached and every caller that waited on it makes its own call, as the original does."""
+    fut = _S2CL_MEMO.get(key)
+    if fut is not None:
+        try:
+            res, retried = await asyncio.shield(fut)
+            if not retried:
+                return res
+        except Exception:
+            pass
+        return await make()
+    if len(_S2CL_MEMO) > 20000:
+        _S2CL_MEMO.clear()
+    box = {"retried": False}
+
+    async def run():
+        _S2CL_RETRIED.set(box)
+        res = await make()
+        return res, box["retried"]
+
+    fut = asyncio.ensure_future(run())
+    _S2CL_MEMO[key] = fut
+
+    def _done(f):
+        if (f.cancelled() or f.exception() is not None or f.result()[1]) and _S2CL_MEMO.get(key) is f:
+            del _S2CL_MEMO[key]
+    fut.add_done_callback(_done)
+    return (await asyncio.shield(fut))[0]
+
+
+_s2cl_decompose_orig = _s2cl_decompose
+_s2cl_verify_orig = _s2cl_verify
+
+
+async def _s2cl_decompose(vlm: AsyncOpenAI, model: str, prompt_url: str, seed: int) -> PromptChecklist:
+    key = ("d", model, len(prompt_url), hash(prompt_url), seed)
+    return await _s2cl_memo(key, lambda: _s2cl_decompose_orig(vlm, model, prompt_url, seed))
+
+
+async def _s2cl_verify(vlm: AsyncOpenAI, model: str, prompt_url: str, grid_url: str, checklist: PromptChecklist,
+                       seed: int) -> VerificationResult:
+    key = ("v", model, len(prompt_url), hash(prompt_url), len(grid_url), hash(grid_url), checklist.model_dump_json(), seed)
+    return await _s2cl_memo(key, lambda: _s2cl_verify_orig(vlm, model, prompt_url, grid_url, checklist, seed))
+
+
 def _s2cl_score(result: VerificationResult) -> int:
     base = sum(S2_CHECKLIST_MATCH_SCORES.get(c.match, 0) for c in result.checks)
     return base + (S2_CHECKLIST_MAIN_BONUS if result.main_object_correct else 0)
@@ -1147,6 +1233,62 @@ def _read_png_rgb(data: bytes) -> tuple[int, int, int, list[list[int]]]:
 
 
 def _foreground_stats(rgb_pngs: list[bytes]) -> dict:
+    """[patch_loop] numpy version of _foreground_stats_ref: same samples, same float64 arithmetic in the same order
+    (luma summed sequentially), so the returned stats are identical; non 8-bit RGB/RGBA PNGs use the original."""
+    try:
+        import io as _io
+        import numpy as _np
+        from PIL import Image as _Image
+        arrs = []
+        for data in rgb_pngs:
+            # [review fix] accept only what the original decoder accepts: 8-bit RGB/RGBA, non-interlaced IHDR first,
+            # and an IDAT stream that zlib.decompress (with adler32 check) inflates to at least the full image size.
+            if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR" or data[24] != 8 or data[25] not in (2, 6) or data[28] != 0:
+                return _foreground_stats_ref(rgb_pngs)
+            _w, _h = struct.unpack(">II", data[16:24])
+            _pos, _idat = 8, []
+            while _pos < len(data):
+                _n = struct.unpack(">I", data[_pos:_pos + 4])[0]; _t = data[_pos + 4:_pos + 8]
+                if _t == b"IDAT": _idat.append(data[_pos + 8:_pos + 8 + _n])
+                elif _t == b"IEND": break
+                _pos += 12 + _n
+            if len(zlib.decompress(b"".join(_idat))) < _h * (1 + _w * (3 if data[25] == 2 else 4)):
+                return _foreground_stats_ref(rgb_pngs)
+            im = _Image.open(_io.BytesIO(data))
+            if im.mode not in ("RGB", "RGBA"):
+                return _foreground_stats_ref(rgb_pngs)
+            im.load()
+            arrs.append(_np.asarray(im)[::S3_SAMPLE_STEP, ::S3_SAMPLE_STEP, :3].astype(_np.int64))
+    except Exception:
+        return _foreground_stats_ref(rgb_pngs)
+    foreground = pale = grayish = 0
+    luma_sum = 0.0
+    for a in arrs:
+        r, g, b = a[..., 0], a[..., 1], a[..., 2]
+        d = _np.maximum(_np.maximum(_np.abs(r - S3_BACKGROUND_RGB[0]), _np.abs(g - S3_BACKGROUND_RGB[1])),
+                        _np.abs(b - S3_BACKGROUND_RGB[2]))
+        m = d > S3_BACKGROUND_TOLERANCE
+        r, g, b = r[m], g[m], b[m]
+        max_c = _np.maximum(_np.maximum(r, g), b)
+        min_c = _np.minimum(_np.minimum(r, g), b)
+        sat = _np.where(max_c > 0, (max_c - min_c) / _np.where(max_c > 0, max_c, 1), 0.0)
+        luma = 0.2126 * r + 0.7152 * g + 0.0722 * b
+        foreground += int(m.sum())
+        for v in luma.tolist():
+            luma_sum += v
+        grayish += int((sat < S3_GRAYISH_SAT_MAX).sum())
+        pale += int(((luma > S3_PALE_LUMA_MIN) & (sat < S3_PALE_SAT_MAX)).sum())
+    if foreground == 0:
+        return {"foreground_samples": 0, "pale_fraction": 0.0, "grayish_fraction": 0.0, "mean_luma": 0.0}
+    return {
+        "foreground_samples": foreground,
+        "pale_fraction": pale / foreground,
+        "grayish_fraction": grayish / foreground,
+        "mean_luma": luma_sum / foreground,
+    }
+
+
+def _foreground_stats_ref(rgb_pngs: list[bytes]) -> dict:
     foreground = 0
     pale = 0
     grayish = 0
@@ -1205,7 +1347,7 @@ async def _s3_run(
         return {"fired": False, "choice": None, "reason": "gray PNGs unavailable"}
 
     try:
-        stats = _foreground_stats([a_png, b_png])
+        stats = await asyncio.to_thread(_foreground_stats, [a_png, b_png])
     except Exception as exc:
         logger.warning(f"s3 foreground stats failed: {exc}")
         return {"fired": False, "choice": None, "reason": "stats parse failed"}
@@ -1496,11 +1638,22 @@ async def evaluate_duel(
         return await _s2bv_run(vlm, model, prompt_data_url, left_views, right_views, left_embeds, right_embeds, seed)
 
     t = asyncio.get_running_loop().time()
-    bv, ac, cl = await asyncio.gather(
-        _bv_with_embeddings(),
-        _s2ac_run(vlm, model, prompt_data_url, left_views, right_views, seed),
-        _s2cl_run(vlm, model, prompt_data_url, left_views, right_views, seed),
-    )
+    if not _lazy_ac_on():
+        bv, ac, cl = await asyncio.gather(
+            _bv_with_embeddings(),
+            _s2ac_run(vlm, model, prompt_data_url, left_views, right_views, seed),
+            _s2cl_run(vlm, model, prompt_data_url, left_views, right_views, seed),
+        )
+    else:   # [patch_loop] edit 12: bv + cl first; ac only if it can still change the S2 choice
+        bv, cl = await asyncio.gather(
+            _bv_with_embeddings(),
+            _s2cl_run(vlm, model, prompt_data_url, left_views, right_views, seed),
+        )
+        if _s2_ac_matters(*_s2_penalty_vote(bv, S2_BV_MIN_GAP), *_s2_checklist_vote(cl, S2_CL_MIN_GAP)):
+            ac = await _s2ac_run(vlm, model, prompt_data_url, left_views, right_views, seed)
+        else:
+            ac = None
+            detail["s2_ac_skipped"] = True
 
     bv_vote, bv_diff = _s2_penalty_vote(bv, S2_BV_MIN_GAP)
     ac_vote, ac_diff = _s2_penalty_vote(ac, S2_AC_MIN_GAP)
@@ -1543,6 +1696,8 @@ async def evaluate_duel(
         "checklist": cl,
     }
     detail["s2_slim"] = _slim_s2(bv, ac, cl, strong_choice, s2_source)
+    if detail.get("s2_ac_skipped"):
+        detail["s2_slim"]["ac_skipped"] = True
 
     if max_stage < 3:
         detail["decided_by"] = s2_decided_by

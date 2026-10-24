@@ -96,7 +96,12 @@ class JudgeAgent(BaseAgent):
         return "A", "draw -> A (no DINO signal)", False
 
     def early_stop_for_round(self, round_no: int) -> bool:
-        return self.s1_early_stop.enabled and round_no <= self.s1_early_stop.max_round
+        # [R84 jalign] PGH_S1ES_MAX_ROUND (pgh_jalign.py): unset = the config's max_round, as pgh17
+        max_round = self.s1_early_stop.max_round
+        if __import__("os").environ.get("PGH_S1ES_MAX_ROUND") is not None:
+            import pgh_jalign as _ja
+            max_round = _ja.s1es_max_round(max_round)
+        return self.s1_early_stop.enabled and round_no <= max_round
 
     async def compare(
         self,
@@ -165,6 +170,12 @@ class JudgeAgent(BaseAgent):
 
         if winner == "draw":
             side, tie_note, had_signal = await self._draw_tiebreak(left_views, right_views)
+            if not had_signal and __import__("os").environ.get("PGH_TIE_NEUTRAL", "").strip().lower() in ("1", "on", "true"):
+                # [R86] no DINO signal: a position-free coin instead of "A" (A = the lower bracket position = in R1 always
+                # the first coder's even-k draft under PGH_MIX_SPLIT 0.5). Same inputs -> same side.
+                _h = __import__("hashlib").sha256(f"{task_id}|{match_label}".encode()).digest()[0] & 1
+                side = "B" if _h else "A"
+                tie_note = f"draw -> {side} (no DINO signal: neutral coin, counted like a DINO tie-break)"
             base = str(detail.get("decided_by", "")) or "draw"
             decided_by = f"{base} | {tie_note}"
             reason = str(detail.get("issues", "")) or tie_note
@@ -186,6 +197,13 @@ class JudgeAgent(BaseAgent):
                 if k in detail
             },
         )
+        try:  # [patch_loop] logging only: full slim stage details for offline re-selection
+            import json as _json
+            logger.info(f"{prefix} [DUEL_DETAIL] {task_id} " + _json.dumps(
+                {**verdict.detail, "winner": winner, "side": side, "decided_by": decided_by}, default=str,
+                separators=(",", ":")))
+        except Exception:
+            pass
         logger.info(
             f"{prefix} Finished Task {task_id} | duel_winner={winner} -> {side} | "
             f"decided_by={decided_by} | confidence={confidence:.2f} | "

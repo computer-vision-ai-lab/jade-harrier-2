@@ -14,7 +14,10 @@ import httpx
 from logger_config import logger
 from modules.base import BaseModule
 from modules.renderer.grid import GRID_KEYS, GRID_VIEWS, compose_grid
-from modules.renderer.settings import RendererConfig
+from modules.renderer.settings import (
+    JUDGE_GRID_BG, JUDGE_GRID_LIGHTING, JUDGE_GRID_TILE, RendererConfig, read_judge_grid,
+)
+from modules.renderer.render_timeouts import ENV_NAME as _RT_ENV, effective_timeouts as _rt_effective
 from pipeline.batch_stats import STATS
 from pipeline.task import PipelineTask
 
@@ -46,6 +49,20 @@ class _Slot:
     task: asyncio.Task | None = None
 
 
+class _SpecResp:
+    """[patch_loop] edit 10: the final views of a speculative combined request (render_views_spec), replayed through
+    _render_and_fill's normal response handling as if the final request had just returned them."""
+    status_code = 200
+    text = ""
+
+    def __init__(self, views: dict, lightings_applied: bool = False) -> None:
+        self._views = views
+        self._applied = lightings_applied   # [jgrid] F4: the speculative request's lightings_applied flag
+
+    def json(self) -> dict:
+        return {"views": self._views, "lightings_applied": True} if self._applied else {"views": self._views}
+
+
 class RendererModule(BaseModule):
     _PING_INTERVAL_S = 5.0
     _PING_TIMEOUT_S = 5.0
@@ -56,11 +73,28 @@ class RendererModule(BaseModule):
     _HEALTHY_UPTIME_RESET_S = 60.0
 
     def __init__(self, config: RendererConfig) -> None:
+        # [r42] PGH_RENDER_TIMEOUT_S (render_timeouts.py): unset/0 = the config as-is (same object, old behaviour)
+        _rt, _rt_note = _rt_effective(config.render_timeout_ms, config.protocol_timeout_ms,
+                                      config.request_timeout_s, os.environ.get(_RT_ENV))
+        if _rt_note:
+            (logger.warning if _rt_note.startswith("!!") else logger.info)(f"[RENDERER] {_rt_note}")
+        if _rt != {"render_timeout_ms": config.render_timeout_ms, "protocol_timeout_ms": config.protocol_timeout_ms,
+                   "request_timeout_s": config.request_timeout_s}:
+            config = config.model_copy(update=_rt)
         self.config = config
         self._slots: list[_Slot] = []
         self._dispatch_counter = 0
         self._node_cwd: str | None = None
         self._shutting_down = False
+        # [jgrid] JUDGE_GRID read once here (off | small | contest); unknown -> off + one warning
+        self._jgrid, _warn = read_judge_grid()
+        if _warn:
+            logger.warning(f"[RENDERER] {_warn}")
+        elif self._jgrid != "off":
+            logger.info(f"[RENDERER] JUDGE_GRID={self._jgrid}: judge grid {JUDGE_GRID_TILE} px tiles"
+                        + (f", {JUDGE_GRID_LIGHTING} light, bg {JUDGE_GRID_BG}" if self._jgrid == "contest" else ""))
+        self._jgrid_code_warned = False
+        self._jgrid_noapply = 0          # [jgrid] F4: contest grid views rendered by JS that ignored per-view lighting
 
     async def startup(self) -> None:
         if not _RUNNER_JS.exists():
@@ -259,13 +293,26 @@ class RendererModule(BaseModule):
                 await self._teardown_sidecar(sc)
         self._slots = []
 
-    def _next_sidecar(self) -> _Sidecar | None:
+    def _next_sidecar(self, exclude: int | None = None) -> _Sidecar | None:
         live = [s.sidecar for s in self._slots if s.sidecar is not None]
         if not live:
             return None
-        sc = live[self._dispatch_counter % len(live)]
+        inflight = self.__dict__.setdefault("_inflight", {})   # [patch_loop] least-loaded dispatch
+        start = self._dispatch_counter % len(live)
+        order = live[start:] + live[:start]
+        if exclude is not None and len(order) > 1:   # a retry never goes back to the sidecar that just failed
+            order = [s for s in order if s.idx != exclude] or order
+        sc = min(order, key=lambda s: inflight.get(s.idx, 0))
         self._dispatch_counter += 1
         return sc
+
+    def _inflight_release(self, idx: int, failed: bool) -> None:
+        # [patch_loop] a failed post (exception or HTTP 5xx) keeps counting as busy for 5 s, so a fast-failing
+        # sidecar does not look idle and pull the traffic
+        if failed:
+            asyncio.get_running_loop().call_later(5.0, self._inflight_release, idx, False)
+        else:
+            self._inflight[idx] -= 1
 
     async def _post_with_retry(self, path: str, payload: dict) -> tuple[httpx.Response, int]:
         """POST to a live sidecar; on a dead-channel error retry once,
@@ -279,13 +326,22 @@ class RendererModule(BaseModule):
         if sc is None:
             raise RuntimeError("no sidecars available")
         try:
-            resp = await sc.client.post(
-                f"http://{self.config.sidecar_host}:{sc.port}{path}", json=payload
-            )
+            self._inflight[sc.idx] = self._inflight.get(sc.idx, 0) + 1
+            _failed = True
+            try:
+                resp = await sc.client.post(
+                    f"http://{self.config.sidecar_host}:{sc.port}{path}", json=payload
+                )
+                _failed = resp.status_code >= 500
+            except asyncio.CancelledError:
+                _failed = False
+                raise
+            finally:
+                self._inflight_release(sc.idx, _failed)
             return resp, sc.idx
         except (*_RETRYABLE_ERRORS, RuntimeError) as exc:
             first_idx = sc.idx
-            retry_sc = self._next_sidecar()
+            retry_sc = self._next_sidecar(exclude=first_idx)
             if retry_sc is not None and retry_sc.idx == first_idx:
                 alt = self._next_sidecar()
                 if alt is not None and alt.idx != first_idx:
@@ -296,9 +352,18 @@ class RendererModule(BaseModule):
                 f"[RENDERER] {path} on sidecar #{first_idx} failed "
                 f"({type(exc).__name__}: {exc}) — retrying on sidecar #{retry_sc.idx}"
             )
-            resp = await retry_sc.client.post(
-                f"http://{self.config.sidecar_host}:{retry_sc.port}{path}", json=payload
-            )
+            self._inflight[retry_sc.idx] = self._inflight.get(retry_sc.idx, 0) + 1
+            _failed = True
+            try:
+                resp = await retry_sc.client.post(
+                    f"http://{self.config.sidecar_host}:{retry_sc.port}{path}", json=payload
+                )
+                _failed = resp.status_code >= 500
+            except asyncio.CancelledError:
+                _failed = False
+                raise
+            finally:
+                self._inflight_release(retry_sc.idx, _failed)
             return resp, retry_sc.idx
 
     async def process(self, task: PipelineTask) -> PipelineTask:
@@ -356,7 +421,86 @@ class RendererModule(BaseModule):
                 logger.warning(f"[RENDERER] probe view {name!r} decode failed: {exc}")
         return rendered
 
+    async def render_views_spec(
+        self, task: PipelineTask, views: list[str], *, img_size: int
+    ) -> dict[str, bytes]:
+        """[patch_loop] edit 10 (SPEC_FINAL=1; called by orient_task inside the probe's render slot). ONE request = the
+        probe views as render_views sends them (+ "size", key "probe_<view>": right/back/left/top_down are final view
+        names too) + the final views exactly as process_with_judge_views builds them, at options.imgSize. Returns the
+        probe views like render_views; the final views are kept on the task (single use, dropped by orient_task unless
+        the decision is "no rotation") for _render_and_fill. Any failure -> the leader's own probe request."""
+        task.__dict__.pop("_spec_final", None)
+        if self.__dict__.get("_spec_broken") or task.failed or task.scene_json is None:
+            return await self.render_views(task, views, img_size=img_size)
+        finals = self._spec_final_specs()
+        payload: dict = {
+            "views": [{"name": v, "bg": self.config.judge_white_bg, "key": f"probe_{v}", "size": img_size}
+                      for v in views] + finals,
+            "options": {"imgSize": self.config.img_size, "lighting": self.config.lighting.value},
+            "object": task.scene_json,
+        }
+        why = None
+        try:
+            resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
+            if resp.status_code != 200:
+                why = f"HTTP {resp.status_code}"
+            else:
+                got = resp.json().get("views") or {}
+                probe = {v: base64.b64decode(got[f"probe_{v}"]) for v in views}
+                bad = [v for v, b in probe.items() if b[12:16] != b"IHDR"
+                       or int.from_bytes(b[16:20], "big") != img_size or int.from_bytes(b[20:24], "big") != img_size]
+                if bad:
+                    self._spec_broken = True
+                    why = f"probe views {bad} not {img_size} px (render_service JS without per-view sizes?) -> SPEC_FINAL off"
+                    logger.error(f"[RENDERER] speculative final: {why}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - incl. a missing probe key or a bad base64 view
+            why = f"{type(exc).__name__}: {exc}"
+        if why is not None:
+            logger.warning(f"[RENDERER] '{task.stem}' spec probe FAIL ({why}) -> plain probe")
+            return await self.render_views(task, views, img_size=img_size)
+        task._spec_final = (finals, task.scene_json, task.js_code,
+                            {k: b for k, b in got.items() if not k.startswith("probe_")}, sidecar_idx,
+                            resp.json().get("lightings_applied") is True)
+        return probe
+
+    def _spec_final_specs(self) -> list[dict]:
+        """[patch_loop] edit 10: the view specs process_with_judge_views sends (kept in sync by _spec_take's check)."""
+        specs = self._grid_specs()
+        specs += [{"name": n, "bg": self.config.judge_white_bg} for n in self._JUDGE_WHITE_VIEWS]
+        specs.append({
+            "name": self._JUDGE_GRAY_VIEW,
+            "bg": self.config.judge_gray_bg,
+            "key": self._JUDGE_GRAY_KEY,
+        })
+        return specs
+
+    def spec_ready(self, task: PipelineTask) -> bool:
+        """[patch_loop] edit 10: process_with_judge_views(task) will replay a kept speculative final (no request)."""
+        s = task.__dict__.get("_spec_final")
+        return (s is not None and s[1] is not None and s[1] is task.scene_json and s[2] == task.js_code
+                and s[0] == self._spec_final_specs())
+
+    def _spec_take(self, task: PipelineTask, view_specs: list[dict]):
+        """[patch_loop] edit 10: pop the kept speculative final; a (response, sidecar_idx) pair only when it was
+        rendered from this very scene with exactly these view specs."""
+        s = task.__dict__.pop("_spec_final", None)
+        if s is None:
+            return None
+        if s[1] is None or s[1] is not task.scene_json or s[2] != task.js_code or s[0] != view_specs:
+            logger.warning(f"[RENDERER] '{task.stem}' speculative final discarded (request differs)")
+            return None
+        logger.info(f"[RENDERER] '{task.stem}' speculative final reused (rendered with the probe)")
+        return _SpecResp(s[3], s[5]), s[4]
+
     def _grid_specs(self) -> list[dict]:
+        if self.__dict__.get("_jgrid") == "contest":   # [jgrid] per-view size/bg/lighting = contest /render/grid tiles
+            return [
+                {"theta": theta, "phi": phi, "key": key, "bg": JUDGE_GRID_BG, "size": JUDGE_GRID_TILE,
+                 "lighting": JUDGE_GRID_LIGHTING}
+                for (theta, phi), key in zip(GRID_VIEWS, GRID_KEYS)
+            ]
         bg = self.config.bg_color
         return [
             {"theta": theta, "phi": phi, "key": key, **({"bg": bg} if bg else {})}
@@ -401,8 +545,12 @@ class RendererModule(BaseModule):
         )
 
         t0 = time.monotonic()
+        _spec = self._spec_take(task, view_specs)   # [patch_loop] edit 10: None unless SPEC_FINAL kept this final
         try:
-            resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
+            if _spec is not None:
+                resp, sidecar_idx = _spec
+            else:
+                resp, sidecar_idx = await self._post_with_retry("/render/views", payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -425,6 +573,13 @@ class RendererModule(BaseModule):
             )
             return {}
 
+        if (use_object and any("lighting" in s for s in view_specs)
+                and resp.json().get("lightings_applied") is not True):   # [jgrid] F4: old JS draws neutral tiles
+            self._jgrid_noapply += 1
+            if self._jgrid_noapply == 1:
+                logger.error(f"[RENDERER] JUDGE_GRID=contest: render_service did not apply per-view lighting "
+                             f"('{task.stem}'): old JS? grid tiles are NOT contest-exact (counted in _jgrid_noapply)")
+
         rendered: dict[str, bytes] = {}
         for name, b64 in (resp.json().get("views") or {}).items():
             try:
@@ -434,9 +589,20 @@ class RendererModule(BaseModule):
 
         try:
             tiles = [rendered.pop(key) for key in GRID_KEYS]
-            task.rendered_png = compose_grid(
-                tiles, img_size=self.config.img_size, gap=self.config.grid_gap
-            )
+            _jg = self.__dict__.get("_jgrid", "off")
+            if _jg == "off":
+                task.rendered_png = await asyncio.to_thread(
+                    compose_grid, tiles, img_size=self.config.img_size, gap=self.config.grid_gap
+                )
+            else:   # [jgrid] 518 px tiles; larger tiles (small mode, or the code path ignoring "size") downscaled
+                if _jg == "contest" and not use_object and not self._jgrid_code_warned:
+                    self._jgrid_code_warned = True
+                    logger.warning("[RENDERER] JUDGE_GRID=contest on the code render path: per-view size/lighting "
+                                   "not supported there -> grey neutral tiles downscaled (grid not contest-exact)")
+                task.rendered_png = await asyncio.to_thread(
+                    compose_grid, tiles, img_size=min(JUDGE_GRID_TILE, self.config.img_size),
+                    gap=self.config.grid_gap, downscale=True
+                )
         except (KeyError, ValueError) as exc:
             task.render_errors = [f"grid tile invalid: {exc}"]
             STATS.render_done(task.render_ms / 1000.0, False)

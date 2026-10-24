@@ -41,7 +41,9 @@ class ObjectPool {
     const idx = await this._acquire();
     try {
       const dataUrls = await this._renderInSlot(idx, '__renderViews', object, params);
-      return dataUrls.map(dataUrlToBuffer);
+      const bufs = dataUrls.map(dataUrlToBuffer);
+      if (dataUrls.lightingsApplied) bufs.lightingsApplied = true;  // [jgrid] the page switched lighting per view
+      return bufs;
     } finally {
       this._release(idx);
     }
@@ -97,6 +99,7 @@ class ObjectPool {
         RENDER_TIMEOUT_MS,
       );
       if (result.error) throw new Error(result.error);
+      if (result.lightings_applied === true) result.data.lightingsApplied = true;  // [jgrid]
       return result.data;
     } catch (err) {
       await this._disposeSlot(slot);

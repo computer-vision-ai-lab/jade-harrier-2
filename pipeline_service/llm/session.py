@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Any, Generic, TypeVar
 
@@ -216,6 +217,8 @@ class SessionAgent(Generic[T]):
             response = await async_retry(_make_call, max_retries=2, no_retry=(APITimeoutError,))
             choice = response.choices[0]
             msg = choice.message
+            if os.environ.get("RUNAWAY_GUARD", "0") == "1":   # [runaway_guard] remember why this turn ended
+                self.last_finish_reason = getattr(choice, "finish_reason", None)
 
             usage = getattr(response, "usage", None)
             if usage is not None:

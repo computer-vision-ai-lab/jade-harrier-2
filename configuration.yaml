@@ -4,8 +4,8 @@ api:
   debug: true
 
 pipeline:
-  batch_time_budget: 36000
-  candidate_deadline_s: 0
+  batch_time_budget: 3000
+  candidate_deadline_s: 2100
   prompt_timeout: 600.0
   use_planner: false
   render_from_object: true
@@ -42,28 +42,45 @@ llm_clients:
     api_key: "local"
     request_timeout_s: 900
     vllm:
-      model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane"
-      revision: "ffdf2798befae9eb6cb32ba9983afb99d3215bcd"
+      model: "computer-vision-ai-lab/Qwen-3.6-27B-CopperTern"
+      revision: "f658895e16bff165e010ff559112c48d74a838a9"
       gpu_ids: "0,1"
       tensor_parallel_size: 1
       data_parallel_size: 2
-      # scripts/burst/vllm_shim.sh = the coder vLLM (+ --enable-sleep-mode) behind a least-in-flight proxy on :8001, with one
-      # sleeping GLM judge per coder GPU (:8031, :8032) that llm/burst.py wakes for the judge-only tail of each batch;
-      # "--burst-glm <util>" is the GLM's memory share at its start (it sleeps to ~2 GB before the coder starts).
-      # Drop --burst-glm (or set BURST_GLM_URLS="") for the plain coder.
-      vllm_bin: "/opt/vllm-coder-env/bin/vllm"
+      vllm_bin: "/opt/prefetch/shim_a2b.sh"
       gpu_memory_utilization: 0.9
       max_model_len: 81920
       max_num_seqs: 256
-      # DFlash speculative decoding (vLLM >= 0.28; run.sh builds the coder env with CODER_VLLM_VERSION=0.32.0): the draft is
-      # prefetched and pinned by revision like the target (llm/spawn.py). Measured: accept length 6.4,
-      # 1.8-1.9x the MTP k=2 throughput at C8-16 (H100), 1.9x at C32 (H200).
-      speculative:
-        method: "dflash"
-        model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane-DFlash"
-        revision: "aa8a895959c6e4e48eb5a2bf1044f727932fed3d"
-        num_speculative_tokens: 7
-      extra_args: []
+      extra_args: ["--sgl", "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", "computer-vision-ai-lab/UtevoLux-DFlash-test", "--speculative-draft-model-revision", "89ae3e2522c74701086bb78d5248f5fc32722c9a", "--speculative-num-draft-tokens", "8", "--mamba-radix-cache-strategy", "extra_buffer_lazy", "--mamba-ssm-dtype", "bfloat16", "--max-mamba-cache-size", "240", "--max-running-requests", "256", "--chunked-prefill-size", "8192", "--enable-metrics", "--random-seed", "42", "--burst-glm", "0.80", "--enable-memory-saver", "--enable-weights-cpu-backup", "--enable-draft-weights-cpu-backup"]
+    # [pgh17 mix] (pipeline_service/pgh_mix.py): used ONLY when PGH_MIX_CODERS names "utevo" (else ignored = exactly pgh16)
+    mix:
+      name: "utevo"
+      gpu_ids: "0"
+      data_parallel_size: 1
+  # [pgh17 mix] the 2nd coder: AmberKite@a6018507 + AK-DFlash@285795f0 (= pgh7's coder, its flags verbatim). enabled: false =
+  # never started unless PGH_MIX_CODERS names "ak" (pgh_mix.apply_cfg enables it and puts it on mix.gpu_ids). Its prompt is
+  # chosen per coder by PGH_MIX_PROMPTS (default ak=pgh7: the prompt AmberKite was tuned on; UtevoLux keeps ES's).
+  # Port 8051: 8003-8010 = render sidecars, 8020 = judge b, 8031+ = burst GLMs.
+  coder-instance-b:
+    enabled: false
+    base_url: "http://localhost:8051/v1"
+    api_key: "local"
+    request_timeout_s: 900
+    vllm:
+      model: "computer-vision-ai-lab/Qwen-3.6-27B-CopperTern"
+      revision: "f658895e16bff165e010ff559112c48d74a838a9"
+      gpu_ids: "1"
+      tensor_parallel_size: 1
+      data_parallel_size: 1
+      vllm_bin: "/opt/prefetch/shim_a2b.sh"
+      gpu_memory_utilization: 0.9
+      max_model_len: 81920
+      max_num_seqs: 256
+      extra_args: ["--sgl", "--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", "computer-vision-ai-lab/UtevoLux-DFlash-test", "--speculative-draft-model-revision", "89ae3e2522c74701086bb78d5248f5fc32722c9a", "--speculative-num-draft-tokens", "8", "--mamba-radix-cache-strategy", "extra_buffer_lazy", "--mamba-ssm-dtype", "bfloat16", "--max-mamba-cache-size", "240", "--max-running-requests", "256", "--chunked-prefill-size", "8192", "--enable-metrics", "--random-seed", "42", "--burst-glm", "0.80", "--enable-memory-saver", "--enable-weights-cpu-backup", "--enable-draft-weights-cpu-backup"]
+    mix:
+      name: "ak"
+      gpu_ids: "1"
+      data_parallel_size: 1
   judge-critic-instance:
     enabled: true
     base_url: "http://localhost:8002/v1"
@@ -79,7 +96,7 @@ llm_clients:
       max_model_len: 81920
       max_num_seqs: 64
       extra_args: ["--max-num-batched-tokens", "16384"]
-      vllm_bin: "/workspace/scripts/judgefast/vllm_enc.sh"
+      vllm_bin: "/opt/jf/vllm_enc.sh"
       trust_remote_code: true
       reasoning_parser: null
   judge-critic-instance-b:
@@ -97,7 +114,7 @@ llm_clients:
       max_model_len: 81920
       max_num_seqs: 64
       extra_args: ["--max-num-batched-tokens", "16384"]
-      vllm_bin: "/workspace/scripts/judgefast/vllm_enc.sh"
+      vllm_bin: "/opt/jf/vllm_enc.sh"
       trust_remote_code: true
       reasoning_parser: null
 
@@ -108,7 +125,7 @@ embedder:
 actors:
   planner:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane"
+    model: "computer-vision-ai-lab/Qwen-3.6-27B-CopperTern"
     workers: 256
     queue_size: 128
     max_tokens: 32768
@@ -126,8 +143,8 @@ actors:
       allow_fallbacks: true
   coder:
     client: "coder-instance"
-    model: "computer-vision-ai-lab/Qwen-3.6-27B-IndigoCrane"
-    workers: 96
+    model: "computer-vision-ai-lab/Qwen-3.6-27B-CopperTern"
+    workers: 128
     queue_size: 64
     max_tokens: 24576
     temperature: 0.7
@@ -139,7 +156,7 @@ actors:
     seed: 42
     enable_thinking: false
     multimodal: true
-    ensemble_size: 58
+    ensemble_size: 74
     ensemble_temperature: 0.7
     providers:
       order: []
@@ -194,7 +211,7 @@ actors:
 
 event_bus:
   max_iter: 2
-  task_deadline_s: 36000
+  task_deadline_s: 2700
   score_threshold: 0.55
 
 js_checker:
@@ -206,7 +223,7 @@ renderer:
   sidecar_port: 8003
   startup_timeout_s: 60.0
   request_timeout_s: 90.0
-  node_binary: "node"
+  node_binary: "/opt/raff/node_aff.sh"
   img_size: 1024
   grid_gap: 5
   bg_color: null

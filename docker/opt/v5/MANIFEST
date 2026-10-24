@@ -1,0 +1,17 @@
+d51acdc03fc06aff91f48c9f3bcd9274  casc/README.md
+51aa5b8fe22f5c82f5d0a5232b104b31  casc/apply_casc.py
+407efa31e558a83ffbf1d1ea69fc695d  casc/kopt_casc.py
+b1d8420069432a0a98dede33ca0efb6f  fusedq/README.md
+c1e6b61206398c72f716028a34e976d8  fusedq/apply_fusedq.py
+023b541fce39a14f49a3e5804c84f22b  fusedq/fusedq.py
+7e82f7ee2691b4524e2ab8687b00d954  fusedq/gemma_quant.cuh
+ef25724ae487539f2ee51813e1242871  fusedq/silu_quant.cuh
+a25053b7816c9a272591f618255cc1b8  kopt_shim.sh
+c8d7bfc5b278544e7cde3bbfa2b11fd7  mrope_nb/README.md
+a0a96bdebaf368c5eed169dfd93400d7  mrope_nb/apply_mrope.py
+7169ab69943775c3bee98e2a72a8b4af  topkbf_normcfg/README.md
+81c0174c71fd77e21a8acb2cd03175bc  topkbf_normcfg/normcfg/README.md
+a17693c7b8b59b7c40603684fdb2a948  topkbf_normcfg/normcfg/apply_normcfg.py
+5bb45ce68274aa25e002b69260cb3162  topkbf_normcfg/topkbf/README.md
+3a7b51905202809f048634923ce19284  topkbf_normcfg/topkbf/apply_topkbf.py
+212eaecd507bb36bfa6fa7c5838a02d5  topkbf_normcfg/topkbf/kopt_topkbf.py

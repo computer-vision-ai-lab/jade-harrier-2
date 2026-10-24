@@ -1,10 +1,10 @@
-"""Option A step 2 "burst" : in the judge-only tail of a batch, the 2 coder GPUs become 2 extra GLM judges.
+"""Option A step 2 "burst" (owner 17/10): in the judge-only tail of a batch, the 2 coder GPUs become 2 extra GLM judges.
 
 Mounted as /workspace/llm/burst.py. Enabled by env BURST_GLM_URLS (comma list of the sleeping GLM servers that our
 sgl_shim.sh starts on the coder GPUs, e.g. http://localhost:8031/v1,http://localhost:8032/v1); BURST_PROXY = the coder
 lb_proxy (default http://localhost:8001), which does the actual GPU swap (/burst/to_judge, /burst/to_coder).
 
-Life of a batch (hooks in stages.py and generation_pipeline.py; CTRL is None when disabled -> stock behaviour):
+Life of a batch (hooks in stages.py and generation_pipeline.py; CTRL is None when disabled -> leader behaviour):
   batch_start(n)        new batch of n tasks; coder state is ensured between batches
   coder_begin(k, stem)  a task launched k coder calls (start_coders); coder_end(gen) when each returns
   task_done(stem)       a task is recorded for good (also covers tasks that failed before launching any coder)
@@ -35,7 +35,6 @@ except Exception:  # pragma: no cover
     logger = logging.getLogger(__name__)
 
 CTRL: "BurstController | None" = None
-SETTINGS = None   # set by GenerationPipeline.startup before setup(): the parsed configuration (fallback source of the GLM urls)
 DEBOUNCE_S = float(os.environ.get("BURST_DEBOUNCE_S", "2"))
 DRAIN_S = float(os.environ.get("BURST_DRAIN_S", "330"))   # > judge request_timeout_s (300): never sleep a GLM mid-request
 SLOTS = int(os.environ.get("BURST_SLOTS", "48"))
@@ -149,7 +148,7 @@ class BurstController:
                 except Exception:  # noqa: BLE001
                     pass
             if not js.get("ok"):
-                self.armed = False          # no second try this batch; the batch just runs like the stock
+                self.armed = False          # no second try this batch; the batch just runs like the leader's
                 self._ev("to_judge FAILED", res=js)
                 return
             self.state = "judge"            # GPUs are swapped now, whatever happens next
@@ -225,34 +224,11 @@ class BurstController:
         self._shrink = self._spawn(shrink())
 
 
-def _urls_from_settings(pipeline) -> list[str]:
-    """The GLM judges that scripts/burst/vllm_shim.sh starts on the coder GPUs: one per coder gpu id, ports 8031.. — present iff the
-    coder client runs through the shim with "--burst-glm" in its extra_args (same rule as run.sh). Empty list = burst off."""
-    try:
-        settings = SETTINGS or getattr(pipeline, "settings", None) or getattr(getattr(pipeline, "_pipeline", None), "settings", None)
-        clients = getattr(settings, "llm_clients", None) or {}
-        for cfg in clients.values():
-            v = getattr(cfg, "vllm", None) or (cfg.get("vllm") if isinstance(cfg, dict) else None)
-            if v is None:
-                continue
-            get = (lambda k, d=None: getattr(v, k, d)) if not isinstance(v, dict) else (lambda k, d=None: v.get(k, d))
-            args = [str(x) for x in (get("extra_args") or [])]
-            if "--burst-glm" in args and str(get("vllm_bin") or "").endswith("vllm_shim.sh"):
-                n = len([g for g in str(get("gpu_ids") or "0").split(",") if g.strip()])
-                return [f"http://localhost:{8031 + i}/v1" for i in range(n)]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"[burst] could not derive BURST_GLM_URLS from settings: {exc!r}")
-    return []
-
-
 def setup(pipeline, judge_lb, make_client) -> "BurstController | None":
     """Called once from GenerationPipeline.startup. make_client(name, base_url) -> instrumented AsyncOpenAI."""
     global CTRL
     urls = [u.strip() for u in os.environ.get("BURST_GLM_URLS", "").split(",") if u.strip()]
-    if not urls and "BURST_GLM_URLS" not in os.environ:
-        urls = _urls_from_settings(pipeline)   # launcher did not export it (soft switch / direct serve.py): derive from the config
     if not urls:
-        logger.info("[burst] off (BURST_GLM_URLS empty and no coder client with --burst-glm)")
         return None
     if not hasattr(judge_lb, "add_replicas"):
         logger.warning("[burst] judge client is not the burst balancer -> burst disabled")
@@ -261,6 +237,11 @@ def setup(pipeline, judge_lb, make_client) -> "BurstController | None":
     idxs = judge_lb.add_replicas(clients, active=False)
     sem = getattr(pipeline, "_sem", {}).get("judge")
     CTRL = BurstController(judge_lb, idxs, os.environ.get("BURST_PROXY", "http://localhost:8001"), sem)
+    _mix = __import__("sys").modules.get("pgh_mix")
+    if _mix is not None and _mix.active() and len(_mix.proxy_urls()) > 1:
+        # [mix] R71: each coder has its own lb_proxy (+ its burst GLM): swap all of them together (pgh_mix.FanoutHTTP)
+        CTRL.http, CTRL.proxy = _mix.FanoutHTTP(_mix.proxy_urls(), CTRL.http), ""
+        logger.info(f"[burst] mix: one swap = every coder proxy {_mix.proxy_urls()} (all or none)")
     logger.info(f"[burst] enabled: extra judge replicas {urls} -> balancer idx {idxs}, proxy {CTRL.proxy}, "
                 f"+{SLOTS} duel slots while up, debounce {DEBOUNCE_S}s")
     return CTRL

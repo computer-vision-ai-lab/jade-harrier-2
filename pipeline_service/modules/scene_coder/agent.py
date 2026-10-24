@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import time
 from typing import Any
 
@@ -52,7 +53,7 @@ class SceneCoderAgent(BaseAgent):
         return SessionAgent(
             task_id=task_id,
             actor=actor,
-            system_prompt=CODER_SYSTEM_PROMPT,
+            system_prompt=getattr(self, "pgh_system_prompt", CODER_SYSTEM_PROMPT),   # [pgh17] per-coder (pgh_mix)
             model=self.model,
             tools=None,
             response_model=None,
@@ -99,7 +100,7 @@ class SceneCoderAgent(BaseAgent):
                     f"Coder.code called for Task ID: {task_id} without OSD and without image — "
                     "use_planner=false requires multimodal coder input."
                 )
-            text = CODER_USER_TEMPLATE_IMAGE_ONLY
+            text = getattr(self, "pgh_user_image_only", CODER_USER_TEMPLATE_IMAGE_ONLY)   # [pgh17] per-coder
         if image_bytes:
             ref_b64 = base64.b64encode(image_bytes).decode()
             user_msg: str | list[dict[str, Any]] = [
@@ -240,6 +241,11 @@ class SceneCoderAgent(BaseAgent):
             if self._looks_like_js_module(js):
                 return js
             if attempt >= self.max_output_retries:
+                break
+            if (os.environ.get("RUNAWAY_GUARD", "0") == "1"   # [runaway_guard] a draft cut at max_tokens is not re-asked
+                    and getattr(session, "last_finish_reason", None) == "length"):
+                logger.warning(f"[RUNAWAY_GUARD] Task {session.task_id} | Actor: {session.actor} | "
+                               f"hit max_tokens without a JS module -> dropped, no retry (attempt {attempt})")
                 break
             raw = await session.run(
                 "Your previous response was not a valid raw JavaScript module. "

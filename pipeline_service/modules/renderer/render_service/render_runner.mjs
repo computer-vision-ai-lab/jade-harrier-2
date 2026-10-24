@@ -114,6 +114,8 @@ async function handleRenderViews(req, res) {
   const phis = [];
   const labels = [];
   const bgs = [];
+  const sizes = [];
+  const lightings = [];  // [jgrid] optional per-view lighting (object path only)
   for (const spec of viewSpecs) {
     const name = typeof spec === 'string' ? spec : spec?.name;
     if (name == null && typeof spec === 'object' && spec !== null) {
@@ -129,6 +131,8 @@ async function handleRenderViews(req, res) {
       phis.push(spec.phi);
       labels.push(spec.key);
       bgs.push(spec.bg || null);
+      sizes.push(Number.isInteger(spec.size) ? spec.size : null);
+      lightings.push(spec.lighting || null);
       continue;
     }
     if (typeof spec === 'object' && spec !== null && (spec.theta != null || spec.phi != null)) {
@@ -144,13 +148,21 @@ async function handleRenderViews(req, res) {
     phis.push(preset.phi);
     labels.push(typeof spec === 'string' ? name : (spec.key || name));
     bgs.push(typeof spec === 'string' ? null : (spec.bg || null));
+    sizes.push(typeof spec === 'object' && spec !== null && Number.isInteger(spec.size) ? spec.size : null);
+    lightings.push(typeof spec === 'object' && spec !== null ? (spec.lighting || null) : null);
+  }
+  const badLighting = lightings.find((l) => l !== null && !LIGHTING_MODES.has(l));
+  if (badLighting !== undefined) {
+    sendJson(res, 400, { error: `unknown view lighting '${badLighting}'; expected one of: ${[...LIGHTING_MODES].join(', ')}` });
+    return;
   }
   if (new Set(labels).size !== labels.length) {
     sendJson(res, 400, { error: 'duplicate view keys in request' });
     return;
   }
 
-  const options = { ...(payload.options || {}), thetas, phis, bgs };
+  const options = { ...(payload.options || {}), thetas, phis, bgs, sizes: sizes.some((x) => x) ? sizes : null };
+  if (lightings.some((x) => x)) options.lightings = lightings;  // [jgrid] absent unless a view asks for it
 
   const lightingErr = lightingError(options);
   if (lightingErr) {
@@ -171,7 +183,8 @@ async function handleRenderViews(req, res) {
       total += pngBufs[i].length;
     }
     console.log(`[render_runner] /render/views ok (${hasObject ? 'object' : 'code'}): ${labels.length} views ${total}B in ${ms}ms`);
-    sendJson(res, 200, { views, ms });
+    // [jgrid] report that per-view lighting was applied (absent otherwise, so off responses are unchanged)
+    sendJson(res, 200, pngBufs.lightingsApplied ? { views, ms, lightings_applied: true } : { views, ms });
   } catch (err) {
     const ms = Date.now() - t0;
     console.error(`[render_runner] /render/views fail in ${ms}ms: ${err.message}`);
@@ -263,6 +276,22 @@ const server = http.createServer(async (req, res) => {
     } catch {}
   }
 });
+
+// ---- begin r42_keepalive block ----
+// [r42_keepalive] PGH_RENDER_KEEPALIVE_MS: idle keep-alive time of this server. Unset / "" / "0" / anything that is
+// not plain digits ("off", "-5", "65e3", "65000ms") = Node defaults untouched (keepAliveTimeout 5000 + Node's 1000 ms
+// buffer, headersTimeout 60000). The Python client (httpx, keepalive_expiry 5 s counted from when IT finished reading
+// the response) then reuses sockets this server already closed whenever its event loop lags > ~1 s -> RST ->
+// ReadError -> retry / dropped draft. A value well above 5000 (Dockerfile: 65000) means the client always gives a
+// socket up first. Clamped to [5000, 290000]: never shorter than the default, headersTimeout stays < requestTimeout.
+const KEEPALIVE_RAW = (process.env.PGH_RENDER_KEEPALIVE_MS || '').trim();
+const KEEPALIVE_MS = /^[0-9]+$/.test(KEEPALIVE_RAW) ? parseInt(KEEPALIVE_RAW, 10) : 0;
+if (KEEPALIVE_MS > 0) {
+  server.keepAliveTimeout = Math.min(290000, Math.max(5000, KEEPALIVE_MS));
+  server.headersTimeout = Math.max(server.headersTimeout, server.keepAliveTimeout + 1000);
+  console.log(`[render_runner] keep-alive: keepAliveTimeout=${server.keepAliveTimeout}ms headersTimeout=${server.headersTimeout}ms (PGH_RENDER_KEEPALIVE_MS=${KEEPALIVE_RAW}, node ${process.version})`);
+}
+// ---- end r42_keepalive block ----
 
 async function gracefulShutdown(signal) {
   if (shuttingDown) return;

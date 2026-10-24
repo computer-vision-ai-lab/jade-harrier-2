@@ -1,6 +1,6 @@
 """Least-in-flight HTTP proxy: one OpenAI-style port in front of several single-GPU servers.
 
-The stock pipeline talks to ONE coder URL (localhost:8001, DP2 inside vLLM). SGLang+DFlash was measured as one server per
+The leader pipeline talks to ONE coder URL (localhost:8001, DP2 inside vLLM). SGLang+DFlash was measured as one server per
 GPU (1x H200 NVL, 64 in flight = 1.52x), so for the 2 coder GPUs we run 2 SGLang servers and put this proxy on the coder
 port: each POST goes to the upstream with the fewest requests in flight (ties -> round robin), so 128 client workers
 become ~64 per GPU, exactly the measured setting. Also reused in the judge phase to spread duels over several GLM servers.
@@ -10,7 +10,7 @@ become ~64 per GPU, exactly the measured setting. Also reused in the judge phase
 GET /health -> 200 only if every upstream answers /health 200; GET /lb_stats -> per-upstream counters (json).
 Other GETs go to the first upstream. Non-streaming only (the pipeline never streams).
 
-Burst (option A step 2, `--glm http://127.0.0.1:8031,...` = sleeping GLM judges on the same GPUs):
+Burst (option A step 2, owner 17/10; `--glm http://127.0.0.1:8031,...` = sleeping GLM judges on the same GPUs):
   POST /burst/to_judge : park the coder (new coder requests wait), wait until none in flight, SGLang
                          /release_memory_occupation on every upstream, then GLM /wake_up      -> {"ok", timings}
   POST /burst/to_coder : wait until the GLMs report no running/waiting request (vLLM /metrics, <= 330 s), GLM
@@ -18,7 +18,7 @@ Burst (option A step 2, `--glm http://127.0.0.1:8031,...` = sleeping GLM judges 
                          (the caller drains its judge requests to the GLMs first)
   A failed swap undoes exactly what it did (per-upstream sets); if that fails too, "broken": /health -> 503.
   GET  /burst/state    : {"state": "coder"|"judge", counters}
-  --engine vllm (option C, burst in this pipeline, vLLM 0.24 + MTP coder, no SGLang): the coder
+  --engine vllm (option C, owner 17/10: burst in the LEADER's pipeline, vLLM 0.24 + MTP coder, no SGLang): the coder
   upstreams are vLLM servers started with --enable-sleep-mode (VLLM_SERVER_DEV_MODE=1): "release" = POST /sleep?level=1
   (weights to CPU, KV + prefix cache dropped), "resume" = POST /wake_up, idle = /metrics running + waiting == 0.
   While parked /health answers 200 itself (SGLang's /health runs a generation: never while its memory is released).

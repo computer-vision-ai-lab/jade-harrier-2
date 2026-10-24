@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from modules.scene_coder.few_shot_examples import FEW_SHOT_EXAMPLES
 from modules.scene_coder.threejs_reference import THREEJS_PRIMITIVE_REFERENCE
+from modules.scene_coder.coder_prompt import select_coder_prompt  # [pgh16] env PGH_CODER_PROMPT (default es)
 
 
 THREEJS_OUTPUT_SPEC_REFERENCE = """\
@@ -521,3 +522,10 @@ Seating repair priority:
 - Return ONLY the full corrected JavaScript module source — no prose,
   no markdown fences.
 """
+
+
+# [pgh16] coder prompt variant (modules/scene_coder/coder_prompt.py): es (default) | pgh7 | ours | oursneg
+PGH7_CODER_SYSTEM_PROMPT = CODER_SYSTEM_PROMPT
+PGH7_CODER_USER_TEMPLATE_IMAGE_ONLY = CODER_USER_TEMPLATE_IMAGE_ONLY
+CODER_PROMPT_VARIANT, CODER_SYSTEM_PROMPT, CODER_USER_TEMPLATE_IMAGE_ONLY = select_coder_prompt(
+    PGH7_CODER_SYSTEM_PROMPT, PGH7_CODER_USER_TEMPLATE_IMAGE_ONLY)

@@ -87,6 +87,9 @@ class MinerState:
     def models_ready(self) -> bool:
         if not self.llm_status:
             return True
+        _mix_ready = getattr(__import__("sys").modules.get("pgh_mix"), "READY", None)
+        if _mix_ready is not None:   # [mix] R71: one coder up is enough after PGH_MIX_WAIT_S (pgh_mix.Readiness)
+            return _mix_ready(self.llm_status, ServiceState.RUNNING)
         return all(s == ServiceState.RUNNING for s in self.llm_status.values())
     
     def to_status_response(self) -> dict[str, Any]:

@@ -328,4 +328,12 @@ def _load_yml_config(path: Path) -> dict:
 
 
 data_yaml = _load_yml_config(config_file_dir)
+if str(__import__("os").environ.get("PGH_MIX_CODERS", "") or "").strip().lower() not in ("", "0", "off", "false", "no"):
+    # [mix] R71 two coders on one pod (pgh_mix.py): enable the 2nd coder client + per-coder GPUs; invalid -> unchanged
+    import pgh_mix as _pgh_mix
+    data_yaml = _pgh_mix.apply_cfg(data_yaml, log=lambda m: print(m, flush=True))
+if str(__import__("os").environ.get("PGH_RENDER_SLOTS", "") or "").strip().lower() not in ("", "0", "off", "false", "no"):
+    # [sws] render slots SIDECARS:PAGES:WORKERS from the env (pgh_rslots.py); invalid -> '!!' + unchanged
+    import pgh_rslots as _pgh_rslots
+    data_yaml = _pgh_rslots.apply_cfg(data_yaml, log=lambda m: print(m, flush=True))
 settings = SettingsConf.model_validate(data_yaml)

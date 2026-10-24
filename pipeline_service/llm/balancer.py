@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-# pipeline-speed "option B" : the stock llm/balancer.py (jade-harrier-6 @cddc1970db1a) with LOAD-AWARE
+# pipeline-speed "option B" (owner 17/10): the leader's llm/balancer.py (jade-harrier-6 @cddc1970db1a) with LOAD-AWARE
 # judge affinity. Mounted over /workspace/llm/balancer.py in our arm. Same model, same requests, same seeds: only WHICH
-# GLM replica serves a request changes (math-neutral, like the stock own replica choice).
-#   Stock: a task's first request picks the replica with the fewest keys (32 stems -> 16/16) and the key stays there
+# GLM replica serves a request changes (math-neutral, like the leader's own replica choice).
+#   Leader: a task's first request picks the replica with the fewest keys (32 stems -> 16/16) and the key stays there
 #   for the process lifetime. Tasks differ in judge work (bracket size, image sizes), so one replica finishes its 16
 #   early and idles while the other still has a queue (speed8: one judge GPU at 0 % for the last ~100-200 s of a batch).
 #   Here: (1) first request -> the replica with the least work IN FLIGHT (ties: fewest keys, as before); (2) on every
@@ -11,8 +11,8 @@ from __future__ import annotations
 #   the key MOVES there (one prefix-cache miss for that task: system prompt + reference image re-prefilled once), then
 #   stays pinned again; at most one move per key per COOLDOWN_S. (v1 compared totals incl. the task's own requests: a
 #   task alone on a replica ping-ponged, 62 moves for one task in the first 4 min of the 17/10 test.)
-#   JUDGE_LB_MIGRATE=0 -> exactly the stock behaviour (in-flight counting only, no decisions use it).
-# Option A step 2 "burst" : extra GLM replicas on the coder GPUs join for the judge-only tail of a batch:
+#   JUDGE_LB_MIGRATE=0 -> exactly the leader's behaviour (in-flight counting only, no decisions use it).
+# Option A step 2 "burst" (owner 17/10): extra GLM replicas on the coder GPUs join for the judge-only tail of a batch:
 #   add_replicas(clients, active=False) at startup, set_active(idxs, True/False) per batch (llm/burst.py). Inactive
 #   replicas get no picks; a key pinned to a replica that went inactive is reassigned at its next request; while any
 #   burst replica is active, keys move by the load rule above even with JUDGE_LB_MIGRATE=0 (else the fresh replicas
@@ -39,7 +39,7 @@ LOAD_AWARE = os.environ.get("JUDGE_LB_MIGRATE", "1") != "0"
 # move a key when in_flight(own) - in_flight(least) >= max(MIN_GAP, REL_GAP * in_flight(own))  (per unit weight; sim sweep 17/10: 2 / 0.3 best, +4.8 %)
 MIN_GAP = int(os.environ.get("JUDGE_LB_MIN_GAP", "2"))
 REL_GAP = float(os.environ.get("JUDGE_LB_REL_GAP", "0.3"))
-# tie-break among equally loaded replicas: keys ACTIVE in the last ACTIVE_S seconds (the stock version counts keys over the whole
+# tie-break among equally loaded replicas: keys ACTIVE in the last ACTIVE_S seconds (the leader counts keys over the whole
 # process lifetime, which in a 4-batch round would carry earlier batches' finished tasks into later batches' choices)
 ACTIVE_S = float(os.environ.get("JUDGE_LB_ACTIVE_S", "300"))
 COOLDOWN_S = float(os.environ.get("JUDGE_LB_COOLDOWN_S", "20"))
@@ -172,7 +172,7 @@ class LoadBalancedClient:
                 if self._migrating():
                     idx = self._least()
                 else:
-                    # stock: fewest keys per unit weight (32 stems -> 16/16); a key keeps its replica forever
+                    # leader: fewest keys per unit weight (32 stems -> 16/16); a key keeps its replica forever
                     live = [i for i in range(len(self._clients)) if self._active[i]] or [0]
                     idx = min(live, key=lambda i: (self._keys[i] / self._weights[i], i))
                 self._assign[key] = idx
